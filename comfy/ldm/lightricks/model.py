@@ -372,7 +372,7 @@ class GuideAttentionMask:
     _attention_with_guide_mask splits queries into noisy and tracked-guide
     groups, so the largest mask is (1, 1, tracked_count, T).
     """
-    __slots__ = ("guide_start", "tracked_count", "noisy_mask", "tracked_mask")
+    __slots__ = ("guide_start", "tracked_count", "noisy_mask", "tracked_mask", "query_start")
 
     def __init__(self, total_tokens, guide_start, tracked_count, tracked_weights):
         device = tracked_weights.device
@@ -385,6 +385,7 @@ class GuideAttentionMask:
 
         self.guide_start = guide_start
         self.tracked_count = tracked_count
+        self.query_start = 0
 
         self.noisy_mask = torch.zeros((1, 1, 1, total_tokens), device=device, dtype=dtype)
         self.noisy_mask[:, :, :, guide_start:guide_start + tracked_count] = log_w.view(1, 1, 1, -1)
@@ -392,31 +393,58 @@ class GuideAttentionMask:
         self.tracked_mask = torch.zeros((1, 1, tracked_count, total_tokens), device=device, dtype=dtype)
         self.tracked_mask[:, :, :, :guide_start] = log_w.view(1, 1, -1, 1)
 
+    def slice_queries(self, start, stop):
+        sliced = object.__new__(GuideAttentionMask)
+        sliced.guide_start = self.guide_start
+        sliced.tracked_count = self.tracked_count
+        sliced.noisy_mask = self.noisy_mask
+        sliced.tracked_mask = self.tracked_mask
+        sliced.query_start = start
+        return sliced
+
 
 def _attention_with_guide_mask(q, k, v, heads, guide_mask, attn_precision, transformer_options):
     """Apply the guide mask by partitioning Q into noisy and tracked-guide
     groups, so each group needs only its own sub-mask. Avoids materializing
     the (1,1,T,T) dense mask.
     """
+    query_start = guide_mask.query_start
+    query_stop = query_start + q.shape[1]
     guide_start = guide_mask.guide_start
     tracked_end = guide_start + guide_mask.tracked_count
 
     out = torch.empty_like(q)
 
-    if guide_start > 0: # In practice currently guides are always after noise, guard for safety if this changes.
-        out[:, :guide_start, :] = comfy.ldm.modules.attention.optimized_attention(
-            q[:, :guide_start, :], k, v, heads, mask=guide_mask.noisy_mask,
+    noisy_start = query_start
+    noisy_stop = min(query_stop, guide_start)
+    if noisy_stop > noisy_start:
+        local_start = noisy_start - query_start
+        local_stop = noisy_stop - query_start
+        out[:, local_start:local_stop, :] = comfy.ldm.modules.attention.optimized_attention(
+            q[:, local_start:local_stop, :], k, v, heads, mask=guide_mask.noisy_mask,
             attn_precision=attn_precision, transformer_options=transformer_options,
             low_precision_attention=False, # sageattn mask support is unreliable
         )
-    out[:, guide_start:tracked_end, :] = comfy.ldm.modules.attention.optimized_attention(
-        q[:, guide_start:tracked_end, :], k, v, heads, mask=guide_mask.tracked_mask,
-        attn_precision=attn_precision, transformer_options=transformer_options,
-        low_precision_attention=False,
-    )
-    if tracked_end < q.shape[1]: # Every guide token is tracked, and nothing comes after them, guard for safety if this changes.
-        out[:, tracked_end:, :] = comfy.ldm.modules.attention.optimized_attention(
-            q[:, tracked_end:, :], k, v, heads,
+
+    local_tracked_start = max(query_start, guide_start)
+    local_tracked_stop = min(query_stop, tracked_end)
+    if local_tracked_stop > local_tracked_start:
+        q_start = local_tracked_start - query_start
+        q_stop = local_tracked_stop - query_start
+        mask_start = local_tracked_start - guide_start
+        mask_stop = local_tracked_stop - guide_start
+        out[:, q_start:q_stop, :] = comfy.ldm.modules.attention.optimized_attention(
+            q[:, q_start:q_stop, :], k, v, heads,
+            mask=guide_mask.tracked_mask[:, :, mask_start:mask_stop],
+            attn_precision=attn_precision, transformer_options=transformer_options,
+            low_precision_attention=False,
+        )
+
+    tail_start = max(query_start, tracked_end)
+    if query_stop > tail_start:
+        local_start = tail_start - query_start
+        out[:, local_start:, :] = comfy.ldm.modules.attention.optimized_attention(
+            q[:, local_start:, :], k, v, heads,
             attn_precision=attn_precision, transformer_options=transformer_options,
         )
     return out
@@ -461,7 +489,7 @@ class CrossAttention(nn.Module):
             operations.Linear(inner_dim, query_dim, dtype=dtype, device=device), nn.Dropout(dropout)
         )
 
-    def forward(self, x, context=None, mask=None, pe=None, k_pe=None, transformer_options={}):
+    def forward(self, x, context=None, mask=None, pe=None, k_pe=None, transformer_options={}, sequence_parallel=False):
         self_attn = context is None
         q = self.to_q(x)
         context = x if context is None else context
@@ -483,6 +511,12 @@ class CrossAttention(nn.Module):
                 else:
                     q = apply_rotary_emb(q, pe)
                     k = apply_rotary_emb(k, pe if k_pe is None else k_pe)
+
+            sp_context = transformer_options.get("sequence_parallel_context") if sequence_parallel else None
+            if sp_context is not None:
+                k, v = sp_context["coordinator"].exchange(
+                    sp_context["rank"], (k.contiguous(), v.contiguous()), (1, 1)
+                )
 
             if mask is None:
                 out = comfy.ldm.modules.attention.optimized_attention(q, k, v, self.heads, attn_precision=self.attn_precision, transformer_options=transformer_options)
@@ -551,7 +585,11 @@ class BasicTransformerBlock(nn.Module):
         else:
             norm_x = comfy.quant_ops.ck.rms_adaln(x, scale_msa, shift_msa)
 
-        x += self.attn1(norm_x, pe=pe, mask=self_attention_mask, transformer_options=transformer_options) * gate_msa
+        x += self.attn1(
+            norm_x, pe=pe, mask=self_attention_mask,
+            transformer_options=transformer_options,
+            sequence_parallel=transformer_options.get("ltx_sequence_parallel_local", False),
+        ) * gate_msa
 
         if self.cross_attention_adaln:
             shift_q_mca, scale_q_mca, gate_mca = (self.scale_shift_table[None, None, 6:9].to(device=x.device, dtype=x.dtype) + timestep.reshape(x.shape[0], timestep.shape[1], self.scale_shift_table.shape[0], -1)[:, :, 6:9, :]).unbind(dim=2)
@@ -705,6 +743,7 @@ class LTXBaseModel(torch.nn.Module, ABC):
     This class defines the common interface and shared functionality for all LTX models,
     including LTXV (video) and LTXAV (audio-video) variants.
     """
+    supports_sequence_parallel = False
 
     def __init__(
         self,

@@ -10,6 +10,8 @@ audio stream's shifted schedule internally).
 """
 
 import math
+import logging
+import time
 
 import torch
 import torchaudio
@@ -17,6 +19,7 @@ import torchaudio
 import nodes
 import comfy.model_management
 import comfy.model_sampling
+import comfy.multigpu
 import comfy.nested_tensor
 import comfy.utils
 import node_helpers
@@ -28,6 +31,17 @@ MAX_PIXELS = 768 * 1344
 REF_IMAGE_SHORT_EDGE = 2048
 FPS = 24
 AUDIO_LATENT_FPS = 40
+
+
+def _decode_video_vae_chunk(vae, chunk):
+    with comfy.model_management.cuda_device_context(vae.device):
+        model = vae.first_stage_model
+        z = chunk.to(device=vae.device, dtype=vae.vae_dtype)
+        mean = model.latents_mean.view(1, -1, 1, 1, 1).to(z)
+        std = model.latents_std.view(1, -1, 1, 1, 1).to(z)
+        decoded = model._adaptive_decode(z * std + mean)
+        comfy.model_management.synchronize()
+        return decoded
 
 
 def align_frame_count(n):
@@ -123,6 +137,7 @@ class MiniMaxH3ImageToVideo(io.ComfyNode):
     @classmethod
     def execute(cls, clip, vae, prompt, width, height, length,
                 first_frame=None, last_frame=None) -> io.NodeOutput:
+        stage_start = time.perf_counter()
         latent, frame_count = _empty_av_latent(width, height, length)
 
         images = []
@@ -138,12 +153,28 @@ class MiniMaxH3ImageToVideo(io.ComfyNode):
             images.append(img)
             keyframes.append({"resolved_frame_index": frame_count - 1, "image": img})
 
-        tokens = clip.tokenize(prompt, images=images)
-        cond = clip.encode_from_tokens_scheduled(tokens)
-
         if keyframes:
             for kf in keyframes:
                 kf["latent"] = vae.encode(kf.pop("image"))
+        logging.info(
+            "MiniMax H3 FL2VA: latent and keyframe encoding completed in %.2fs",
+            time.perf_counter() - stage_start,
+        )
+
+        comfy.multigpu.prepare_stage_devices(clip, stage_name="MiniMax H3 Qwen conditioning")
+        qwen_start = time.perf_counter()
+        tokenize_start = time.perf_counter()
+        tokens = clip.tokenize(prompt, images=images)
+        tokenize_elapsed = time.perf_counter() - tokenize_start
+        cond = clip.encode_from_tokens_scheduled(tokens)
+        logging.info(
+            "MiniMax H3 FL2VA: Qwen conditioning completed in %.2fs (tokenize %.2fs)",
+            time.perf_counter() - qwen_start,
+            tokenize_elapsed,
+        )
+        comfy.multigpu.offload_components(clip, stage_name="MiniMax H3 Qwen conditioning")
+
+        if keyframes:
             cond = node_helpers.conditioning_set_values(cond, {
                 "minimax_keyframes": keyframes,
                 "minimax_frame_count": frame_count,
@@ -210,6 +241,7 @@ class MiniMaxH3ReferenceToVideo(io.ComfyNode):
     @classmethod
     def execute(cls, clip, vae, audio_vae, prompt, width, height, length, ref_image_size="match",
                 ref_images=None, ref_videos=None, ref_video_audios=None, ref_audios=None) -> io.NodeOutput:
+        stage_start = time.perf_counter()
         latent, frame_count = _empty_av_latent(width, height, length)
 
         ref_items = []   # for the tokenizer presentation, in request order
@@ -273,11 +305,117 @@ class MiniMaxH3ReferenceToVideo(io.ComfyNode):
             ref_items.append({"type": "audio"})
             ref_blocks.append({"kind": "audio", "ref_audio_t": ref_audio_t, "audio_latent": audio_latent})
 
+        logging.info(
+            "MiniMax H3 Ref2VA: reference encoding completed in %.2fs",
+            time.perf_counter() - stage_start,
+        )
+        comfy.multigpu.prepare_stage_devices(clip, stage_name="MiniMax H3 Qwen conditioning")
+        qwen_start = time.perf_counter()
+        tokenize_start = time.perf_counter()
         tokens = clip.tokenize(prompt, minimax_ref_items=ref_items)
+        tokenize_elapsed = time.perf_counter() - tokenize_start
         cond = clip.encode_from_tokens_scheduled(tokens)
+        logging.info(
+            "MiniMax H3 Ref2VA: Qwen conditioning completed in %.2fs (tokenize %.2fs)",
+            time.perf_counter() - qwen_start,
+            tokenize_elapsed,
+        )
+        comfy.multigpu.offload_components(clip, stage_name="MiniMax H3 Qwen conditioning")
         if ref_blocks:
             cond = node_helpers.conditioning_set_values(cond, {"minimax_refs": ref_blocks})
         return io.NodeOutput(cond, latent)
+
+
+class MiniMaxH3VAEDecodeParallel(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3VAEDecodeParallel",
+            display_name="MiniMax H3 Video VAE Decode (Parallel)",
+            description="Decode independent MiniMax H3 temporal VAE chunks on multiple NPUs.",
+            category="model/latent/minimax",
+            inputs=[
+                io.Latent.Input("samples"),
+                io.Vae.Input("vae"),
+                io.Model.Input("model"),
+            ],
+            outputs=[io.Image.Output()],
+        )
+
+    @classmethod
+    def execute(cls, samples, vae, model) -> io.NodeOutput:
+        latent = samples["samples"]
+        if latent.is_nested:
+            latent = latent.unbind()[0]
+        config = model.model_options.get("multi_npu_parallel_config")
+        if config is None:
+            raise RuntimeError("Parallel VAE decode requires MultiNPUParallelConfig")
+        devices = list(config["devices"])
+        if len(devices) == 1 or latent.shape[2] <= 1:
+            comfy.model_management.unload_model_and_clones(model, all_devices=True)
+            comfy.model_management.soft_empty_cache()
+            images = vae.decode(latent)
+            if images.ndim == 5:
+                images = images.reshape(-1, images.shape[-3], images.shape[-2], images.shape[-1])
+            return io.NodeOutput(images)
+
+        vae_model = vae.first_stage_model
+        if vae_model.__class__.__name__ != "MiniMaxH3VideoVAE":
+            raise TypeError(f"Parallel decode needs MiniMaxH3VideoVAE, got {vae_model.__class__.__name__}")
+
+        chunks = vae_model.prepare_decode_temporal(latent)
+        if len(chunks) < 2:
+            images = vae.decode(latent)
+            if images.ndim == 5:
+                images = images.reshape(-1, images.shape[-3], images.shape[-2], images.shape[-1])
+            return io.NodeOutput(images)
+        replicas = comfy.multigpu.vae_replicas(vae, devices)
+        chunk_shape = tuple(chunks[0].shape)
+        comfy.model_management.load_models_gpu(
+            [replica.patcher for replica in replicas],
+            memory_required=vae.memory_used_decode(chunk_shape, vae.vae_dtype),
+            force_full_load=vae.disable_offload,
+        )
+
+        assignments = {device: [] for device in devices}
+        for index, chunk in enumerate(chunks):
+            assignments[devices[index % len(devices)]].append((index, chunk))
+        replicas_by_device = {replica.device: replica for replica in replicas}
+        decoded = [None] * len(chunks)
+        pool = comfy.multigpu.MultiGPUThreadPool(devices)
+        try:
+            for device in devices:
+                for _, chunk in assignments[device]:
+                    pool.submit(device, _decode_video_vae_chunk, replicas_by_device[device], chunk)
+            for device in devices:
+                for index, _ in assignments[device]:
+                    decoded[index], error = pool.get_result(device)
+                    if error is not None:
+                        raise error
+        finally:
+            pool.shutdown()
+
+        output = torch.empty(
+            vae_model.decode_output_shape(latent.shape),
+            device=vae.output_device,
+            dtype=vae.vae_output_dtype(),
+        )
+        gather_device = devices[0]
+
+        def ordered_chunks():
+            for chunk in decoded:
+                if chunk.device != gather_device:
+                    chunk = chunk.to(gather_device)
+                    comfy.model_management.synchronize()
+                yield chunk
+
+        with comfy.model_management.cuda_device_context(gather_device):
+            vae_model.merge_decode_temporal(ordered_chunks(), output)
+            comfy.model_management.synchronize()
+        images = output.movedim(1, -1)
+        if images.ndim == 5:
+            images = images.reshape(-1, images.shape[-3], images.shape[-2], images.shape[-1])
+        return io.NodeOutput(images)
 
 
 class MiniMaxH3SigmaShift(io.ComfyNode):
@@ -330,6 +468,7 @@ class MiniMaxH3Extension(ComfyExtension):
             EmptyMiniMaxH3LatentAV,
             MiniMaxH3ImageToVideo,
             MiniMaxH3ReferenceToVideo,
+            MiniMaxH3VAEDecodeParallel,
             MiniMaxH3SigmaShift,
             ]
 

@@ -19,10 +19,16 @@ output with no final norm). Vision-pad positions carry adaLN token tag 0
 returned alongside the embeddings as "minimax_token_tags".
 """
 
+import dataclasses
+import functools
+import logging
 import math
 
 import torch
 import torch.nn.functional as F
+import comfy.model_management
+import comfy.multigpu
+from comfy.quant_ops import QuantizedTensor, TensorWiseINT8Layout
 import comfy.sd1_clip
 from .qwen3vl import Qwen3VL, Qwen3VLSDTokenizer
 
@@ -78,6 +84,290 @@ def token_tags_from_embeds_info(seq_len, embeds_info):
     return tags
 
 
+def _slice_tp_weight(weight, world_size, rank, dim):
+    if weight.shape[dim] % world_size != 0:
+        raise ValueError(
+            f"Cannot tensor-parallel shard weight {tuple(weight.shape)} on dim {dim} "
+            f"across {world_size} ranks"
+        )
+    shard_size = weight.shape[dim] // world_size
+    shard_start = rank * shard_size
+
+    if isinstance(weight, QuantizedTensor):
+        if weight._layout_cls != "TensorWiseINT8Layout":
+            raise TypeError(f"Text TP supports TensorWiseINT8Layout, got {weight._layout_cls}")
+        if dim == 1 and getattr(weight._params, "convrot", False):
+            group_size = getattr(weight._params, "convrot_groupsize", 256)
+            if shard_size % group_size != 0:
+                raise ValueError(f"TP input shard {shard_size} is not aligned to ConvRot group size {group_size}")
+        qdata, scale = TensorWiseINT8Layout.get_plain_tensors(weight)
+        qdata = qdata.narrow(dim, shard_start, shard_size).clone()
+        if dim == 0 and scale.numel() == weight.shape[0]:
+            scale = scale.reshape(weight.shape[0], -1).narrow(0, shard_start, shard_size).clone()
+        else:
+            scale = scale.contiguous()
+        params = dataclasses.replace(weight._params, scale=scale, orig_shape=tuple(qdata.shape))
+        return QuantizedTensor(qdata, weight._layout_cls, params)
+
+    return weight.detach().narrow(dim, shard_start, shard_size).clone()
+
+
+def _shard_tp_linear(linear, world_size, rank, dim):
+    weight = _slice_tp_weight(linear.weight, world_size, rank, dim)
+    linear.weight = torch.nn.Parameter(weight, requires_grad=False)
+    if dim == 0:
+        linear.out_features = weight.shape[0]
+        if linear.bias is not None:
+            bias_size = linear.bias.shape[0] // world_size
+            linear.bias = torch.nn.Parameter(
+                linear.bias.detach().narrow(0, rank * bias_size, bias_size).contiguous(),
+                requires_grad=False,
+            )
+    else:
+        linear.in_features = weight.shape[1]
+        if linear.bias is not None and rank != 0:
+            linear.register_parameter("bias", None)
+    if hasattr(linear, "_orig_shape"):
+        linear._orig_shape = tuple(weight.shape)
+
+
+def _resize_tp_linear_topology(linear, world_size, rank, dim):
+    out_features = linear.out_features
+    in_features = linear.in_features
+    if dim == 0:
+        if out_features % world_size != 0:
+            raise ValueError(f"TP output size {out_features} is not divisible by {world_size}")
+        out_features //= world_size
+    else:
+        if in_features % world_size != 0:
+            raise ValueError(f"TP input size {in_features} is not divisible by {world_size}")
+        in_features //= world_size
+
+    linear.out_features = out_features
+    linear.in_features = in_features
+    weight = getattr(linear, "weight", None)
+    if weight is not None:
+        linear.weight = torch.nn.Parameter(
+            torch.empty((out_features, in_features), device="meta", dtype=weight.dtype),
+            requires_grad=False,
+        )
+    bias = getattr(linear, "bias", None)
+    if dim == 0 and bias is not None:
+        linear.bias = torch.nn.Parameter(
+            torch.empty((out_features,), device="meta", dtype=bias.dtype),
+            requires_grad=False,
+        )
+    elif dim == 1 and bias is not None and rank != 0:
+        linear.register_parameter("bias", None)
+    if hasattr(linear, "_orig_shape"):
+        linear._orig_shape = (out_features, in_features)
+
+
+def _minimax_h3_language_model(model):
+    clip_model = getattr(model, "qwen3vl_32b", None)
+    if not isinstance(clip_model, MiniMaxH3ClipModel):
+        raise TypeError("MiniMax H3 text TP requires the MiniMax Qwen3-VL text encoder")
+    return clip_model, clip_model.transformer, clip_model.transformer.model
+
+
+def _validate_tp_heads(language_model, world_size):
+    if language_model.config.num_attention_heads % world_size != 0:
+        raise ValueError("Qwen attention heads are not divisible by the requested TP size")
+    if language_model.config.num_key_value_heads % world_size != 0:
+        raise ValueError("Qwen KV heads are not divisible by the requested TP size")
+
+
+def _prepare_minimax_h3_tp_topology(model, world_size, rank, keep_frontend):
+    _, transformer, language_model = _minimax_h3_language_model(model)
+    _validate_tp_heads(language_model, world_size)
+
+    for layer in language_model.layers:
+        attention = layer.self_attn
+        _resize_tp_linear_topology(attention.q_proj, world_size, rank, dim=0)
+        _resize_tp_linear_topology(attention.k_proj, world_size, rank, dim=0)
+        _resize_tp_linear_topology(attention.v_proj, world_size, rank, dim=0)
+        _resize_tp_linear_topology(attention.o_proj, world_size, rank, dim=1)
+        attention.num_heads //= world_size
+        attention.num_kv_heads //= world_size
+        attention.inner_size //= world_size
+
+        _resize_tp_linear_topology(layer.mlp.gate_proj, world_size, rank, dim=0)
+        _resize_tp_linear_topology(layer.mlp.up_proj, world_size, rank, dim=0)
+        _resize_tp_linear_topology(layer.mlp.down_proj, world_size, rank, dim=1)
+
+    if not keep_frontend:
+        transformer.visual = None
+        language_model.embed_tokens = None
+
+
+_TP_COLUMN_PROJECTIONS = frozenset(("q_proj", "k_proj", "v_proj", "gate_proj", "up_proj"))
+_TP_ROW_PROJECTIONS = frozenset(("o_proj", "down_proj"))
+
+
+def _minimax_h3_tp_state_dict(state_dict, world_size, rank, keep_frontend):
+    sharded = {}
+    for key, value in state_dict.items():
+        if not keep_frontend and (key.startswith("visual.") or key.startswith("model.embed_tokens.")):
+            continue
+
+        parts = key.split(".")
+        projection = parts[-2] if len(parts) >= 2 else ""
+        is_language_projection = len(parts) >= 6 and parts[0] == "model" and parts[1] == "layers"
+        if not is_language_projection or projection not in _TP_COLUMN_PROJECTIONS | _TP_ROW_PROJECTIONS:
+            sharded[key] = value
+            continue
+
+        parameter = parts[-1]
+        if parameter == "weight":
+            dim = 0 if projection in _TP_COLUMN_PROJECTIONS else 1
+            sharded[key] = _slice_tp_weight(value, world_size, rank, dim=dim)
+        elif parameter == "weight_scale" and projection in _TP_COLUMN_PROJECTIONS:
+            # Tensor-wise INT8 stores one scale per output row. Column-parallel
+            # projections shard those rows; row-parallel projections retain all
+            # output rows and therefore share the complete scale tensor.
+            sharded[key] = _slice_tp_weight(value, world_size, rank, dim=0)
+        elif parameter == "bias":
+            if projection in _TP_COLUMN_PROJECTIONS:
+                sharded[key] = _slice_tp_weight(value, world_size, rank, dim=0)
+            elif rank == 0:
+                sharded[key] = value
+        else:
+            # Quantization descriptors such as comfy_quant are metadata, not
+            # projection matrices. Every rank needs the unchanged descriptor.
+            sharded[key] = value
+    logging.info("Prepared MiniMax H3 text TP checkpoint shard %d/%d", rank + 1, world_size)
+    return sharded
+
+
+def minimax_h3_tp_reload_model_options(world_size, rank):
+    if rank < 0 or rank >= world_size:
+        raise ValueError(f"Invalid TP rank {rank} for world size {world_size}")
+    keep_frontend = rank == 0
+    return {
+        "initial_device": torch.device("meta"),
+        "pre_load_model_callback": functools.partial(
+            _prepare_minimax_h3_tp_topology,
+            world_size=world_size,
+            rank=rank,
+            keep_frontend=keep_frontend,
+        ),
+        "state_dict_transform": functools.partial(
+            _minimax_h3_tp_state_dict,
+            world_size=world_size,
+            rank=rank,
+            keep_frontend=keep_frontend,
+        ),
+        "assign_state_dict": True,
+    }
+
+
+def _shard_minimax_h3_text_encoder(model, world_size, rank, keep_frontend):
+    clip_model, transformer, language_model = _minimax_h3_language_model(model)
+    _validate_tp_heads(language_model, world_size)
+
+    for layer in language_model.layers:
+        attention = layer.self_attn
+        _shard_tp_linear(attention.q_proj, world_size, rank, dim=0)
+        _shard_tp_linear(attention.k_proj, world_size, rank, dim=0)
+        _shard_tp_linear(attention.v_proj, world_size, rank, dim=0)
+        _shard_tp_linear(attention.o_proj, world_size, rank, dim=1)
+        attention.num_heads //= world_size
+        attention.num_kv_heads //= world_size
+        attention.inner_size //= world_size
+
+        _shard_tp_linear(layer.mlp.gate_proj, world_size, rank, dim=0)
+        _shard_tp_linear(layer.mlp.up_proj, world_size, rank, dim=0)
+        _shard_tp_linear(layer.mlp.down_proj, world_size, rank, dim=1)
+
+    if not keep_frontend:
+        transformer.visual = None
+        language_model.embed_tokens = None
+    return clip_model
+
+
+def configure_minimax_h3_text_tensor_parallel(patchers, devices):
+    world_size = len(devices)
+    clip_models = []
+    for rank, patcher in enumerate(patchers):
+        clip_models.append(_shard_minimax_h3_text_encoder(
+            patcher.model,
+            world_size=world_size,
+            rank=rank,
+            keep_frontend=rank == 0,
+        ))
+        patcher.size = 0
+
+    return connect_minimax_h3_text_tensor_parallel(patchers, devices)
+
+
+def connect_minimax_h3_text_tensor_parallel(patchers, devices):
+    clip_models = [_minimax_h3_language_model(patcher.model)[0] for patcher in patchers]
+    for patcher in patchers:
+        patcher.size = 0
+    context = MiniMaxH3TextTensorParallel(clip_models, devices)
+    clip_models[0]._minimax_h3_tp_context = context
+    patchers[0].set_additional_models("minimax_h3_text_tp", list(patchers[1:]))
+    return context
+
+
+class MiniMaxH3TextTensorParallel:
+    def __init__(self, clip_models, devices):
+        self.clip_models = tuple(clip_models)
+        self.devices = tuple(devices)
+        self.world_size = len(devices)
+
+    def _rank_forward(self, rank, embeds, position_ids, visual_pos_masks, deepstack, coordinator):
+        device = self.devices[rank]
+        try:
+            with comfy.model_management.cuda_device_context(device):
+                local_embeds = embeds.to(device=device, non_blocking=True)
+                local_positions = None if position_ids is None else position_ids.to(device=device, non_blocking=True)
+                local_mask = None if visual_pos_masks is None else visual_pos_masks.to(device=device, non_blocking=True)
+                local_deepstack = None
+                if deepstack is not None:
+                    local_deepstack = [item.to(device=device, non_blocking=True) for item in deepstack]
+                outputs = self.clip_models[rank].transformer.model(
+                    None,
+                    embeds=local_embeds,
+                    dtype=torch.float32,
+                    position_ids=local_positions,
+                    visual_pos_masks=local_mask,
+                    deepstack_embeds=local_deepstack,
+                    tp_context=coordinator,
+                    tp_rank=rank,
+                )
+                comfy.model_management.synchronize()
+                return outputs[0].float() if rank == 0 else None
+        except Exception:
+            coordinator.abort()
+            raise
+
+    def encode(self, primary, tokens):
+        comfy.model_management.throw_exception_if_processing_interrupted()
+        device = self.devices[0]
+        with comfy.model_management.cuda_device_context(device):
+            embeds, _, _, embeds_info = primary.process_tokens(tokens, device)
+            position_ids, visual_pos_masks, deepstack = primary.transformer.build_image_inputs(embeds, embeds_info)
+            primary.transformer.last_token_tags = token_tags_from_embeds_info(embeds.shape[1], embeds_info)
+            comfy.model_management.synchronize()
+
+        coordinator = comfy.multigpu.TensorParallelCoordinator(list(self.devices))
+        pool = comfy.multigpu.MultiGPUThreadPool(list(self.devices[1:]))
+        try:
+            for rank, rank_device in enumerate(self.devices[1:], start=1):
+                pool.submit(rank_device, self._rank_forward, rank, embeds, position_ids, visual_pos_masks, deepstack, coordinator)
+            output = self._rank_forward(0, embeds, position_ids, visual_pos_masks, deepstack, coordinator)
+            for rank_device in self.devices[1:]:
+                _, error = pool.get_result(rank_device)
+                if error is not None:
+                    raise error
+        finally:
+            pool.shutdown()
+
+        logging.info("MiniMax H3 text encode completed with TP=%s", self.world_size)
+        return output, None
+
+
 class MiniMaxQwen3VL(Qwen3VL):
     model_type = "qwen3vl_32b"
 
@@ -105,6 +395,12 @@ class MiniMaxH3ClipModel(comfy.sd1_clip.SDClipModel):
                          dtype=dtype, special_tokens={"pad": 151643}, layer_norm_hidden_state=False,
                          model_class=MiniMaxQwen3VL, enable_attention_masks=False,
                          return_attention_masks=False, model_options=model_options)
+
+    def encode(self, tokens):
+        tp_context = getattr(self, "_minimax_h3_tp_context", None)
+        if tp_context is not None:
+            return tp_context.encode(self, tokens)
+        return super().encode(tokens)
 
     def encode_token_weights(self, token_weight_pairs):
         out = super().encode_token_weights(token_weight_pairs)

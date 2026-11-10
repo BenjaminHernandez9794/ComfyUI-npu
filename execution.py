@@ -2,7 +2,9 @@ import copy
 import heapq
 import inspect
 import logging
+import os
 import psutil
+import sqlite3
 import sys
 import threading
 import time
@@ -18,7 +20,9 @@ import comfy.memory_management
 import comfy.model_management
 import comfy.model_patcher
 import comfy.model_prefetch
+import comfy.prompt_history
 import comfy_aimdo.model_vbar
+import folder_paths
 from comfy.internal_logging import detail
 
 from latent_preview import set_preview_method
@@ -1246,17 +1250,20 @@ async def validate_prompt(prompt_id, prompt, partial_execution_list: Union[list[
 
     return (True, None, list(good_outputs), node_errors)
 
-MAXIMUM_HISTORY_SIZE = 10000
-
 class PromptQueue:
-    def __init__(self, server):
+    def __init__(self, server, history_path=None):
         self.server = server
         self.mutex = threading.RLock()
         self.not_empty = threading.Condition(self.mutex)
         self.task_counter = 0
         self.queue = []
         self.currently_running = {}
-        self.history = {}
+        if history_path is None:
+            history_path = os.path.join(folder_paths.get_user_directory(), "prompt_history.sqlite3")
+        self.history_store = comfy.prompt_history.PromptHistoryStore(history_path)
+        self.history = self.history_store.load()
+        if self.history:
+            logging.info("Restored %s prompt history items", len(self.history))
         self.flags = {}
 
     def put(self, item):
@@ -1287,8 +1294,6 @@ class PromptQueue:
                   status: Optional['PromptQueue.ExecutionStatus'], process_item=None):
         with self.mutex:
             prompt = self.currently_running.pop(item_id)
-            if len(self.history) > MAXIMUM_HISTORY_SIZE:
-                self.history.pop(next(iter(self.history)))
 
             status_dict: Optional[dict] = None
             if status is not None:
@@ -1303,6 +1308,10 @@ class PromptQueue:
                 'status': status_dict,
             }
             self.history[prompt[1]].update(history_result)
+            try:
+                self.history_store.save(prompt[1], self.history[prompt[1]])
+            except (OSError, sqlite3.Error, TypeError, ValueError):
+                logging.exception("Failed to persist prompt history item %s", prompt[1])
             self.server.queue_updated()
 
     # Note: slow
@@ -1391,10 +1400,12 @@ class PromptQueue:
     def wipe_history(self):
         with self.mutex:
             self.history = {}
+            self.history_store.clear()
 
     def delete_history_item(self, id_to_delete):
         with self.mutex:
             self.history.pop(id_to_delete, None)
+            self.history_store.delete(id_to_delete)
 
     def set_flag(self, name, data):
         with self.mutex:

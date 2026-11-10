@@ -119,6 +119,7 @@ def load_safetensors(ckpt):
     return sd, header.get("__metadata__", {}),
 
 
+@torch.inference_mode(False)
 def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False):
     if device is None:
         device = torch.device("cpu")
@@ -935,11 +936,18 @@ def set_attr(obj, attr, value):
     return prev
 
 def set_attr_param(obj, attr, value):
-    # Clone inference tensors (created under torch.inference_mode) since
-    # their version counter is frozen and nn.Parameter() cannot wrap them.
-    if (not torch.is_inference_mode_enabled()) and value.is_inference():
-        value = value.clone()
-    return set_attr(obj, attr, torch.nn.Parameter(value, requires_grad=False))
+    # Parameter construction calls detach() and initializes a version counter.
+    # Keep the whole operation outside inference mode: some accelerator tensor
+    # formats cannot initialize that counter even when the source itself is not
+    # reported as an inference tensor.
+    with torch.inference_mode(False):
+        if value.is_inference():
+            # The weight-producing paths disable inference mode themselves. This
+            # is a correctness fallback for third-party callers, not the normal
+            # large-model path.
+            value = value.clone()
+        value = torch.nn.Parameter(value, requires_grad=False)
+    return set_attr(obj, attr, value)
 
 def set_attr_buffer(obj, attr, value):
     obj, name = resolve_attr(obj, attr)

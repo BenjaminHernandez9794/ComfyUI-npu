@@ -130,9 +130,16 @@ class WrapperExecutor:
         return cls(original, class_obj, wrappers, idx=idx)
 
 class PatcherInjection:
-    def __init__(self, inject: Callable, eject: Callable):
+    def __init__(self, inject: Callable, eject: Callable, clone_for_model: Callable = None):
         self.inject = inject
         self.eject = eject
+        self._clone_for_model = clone_for_model
+
+    def clone_for_model(self, model):
+        """Return an injection rebound to an independent model instance."""
+        if self._clone_for_model is None:
+            return self
+        return self._clone_for_model(model)
 
 def copy_nested_dicts(input_dict: dict):
     new_dict = input_dict.copy()

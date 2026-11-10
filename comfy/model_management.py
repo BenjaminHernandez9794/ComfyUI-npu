@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import psutil
 import logging
+import concurrent.futures
 from enum import Enum
 from comfy.cli_args import args, PerformanceFeature
 import threading
@@ -290,27 +291,36 @@ def resolve_gpu_device_option(option: str):
 
 @contextmanager
 def cuda_device_context(device):
-    """Context manager that sets torch.cuda.current_device to match *device*.
+    """Context manager that sets the active accelerator to match *device*.
 
     Used when running operations on a non-default CUDA device so that custom
     CUDA kernels (e.g. comfy_kitchen fp8 quantization) pick up the correct
     device index.  The previous device is restored on exit.
 
-    No-op when *device* is not CUDA, has no explicit index, or already matches
-    the current device.
+    No-op when *device* has no explicit index, uses an unsupported backend, or
+    already matches the current device.
     """
     prev = None
+    set_device = None
     if device.type == "cuda" and device.index is not None:
         prev = torch.cuda.current_device()
-        if prev != device.index:
-            torch.cuda.set_device(device)
-        else:
-            prev = None
+        set_device = torch.cuda.set_device
+    elif device.type == "npu" and device.index is not None and is_ascend_npu():
+        prev = torch.npu.current_device()
+        set_device = torch.npu.set_device
+    elif device.type == "xpu" and device.index is not None and is_intel_xpu():
+        prev = torch.xpu.current_device()
+        set_device = torch.xpu.set_device
+
+    if prev == device.index:
+        prev = None
+    elif set_device is not None:
+        set_device(device)
     try:
         yield
     finally:
         if prev is not None:
-            torch.cuda.set_device(prev)
+            set_device(prev)
 
 def get_total_memory(dev=None, torch_total_too=False):
     global directml_enabled
@@ -609,6 +619,8 @@ except:
     pass
 
 current_loaded_models: list[LoadedModel] = []
+current_loaded_models_lock = threading.RLock()
+inactive_dynamic_models = weakref.WeakSet()
 
 DIRTY_MMAPS = set()
 
@@ -637,8 +649,13 @@ PIN_SUBSETS = [ "weights", "patches" ]
 LOADED_PIN_SUBSETS = [ "weights-loaded", "patches-loaded" ]
 
 def models_for_pin_eviction(active, current_prompt=None):
-    for loaded_model in current_loaded_models:
-        model = loaded_model.model
+    models = [loaded_model.model for loaded_model in current_loaded_models]
+    models.extend(list(inactive_dynamic_models))
+    seen = set()
+    for model in models:
+        if model is None or id(model) in seen:
+            continue
+        seen.add(id(model))
         if model is None or not model.is_dynamic():
             continue
         pin_state = model.model.dynamic_pins[model.load_device]
@@ -806,6 +823,22 @@ class LoadedModel:
         self.real_model = None
         return True
 
+    def model_stage_unload(self):
+        """Drop device residency while retaining a source-backed dynamic RAM cache."""
+        model = self.model
+        preserve_ram_cache = (
+            model.is_dynamic()
+            and model.cached_patcher_init_from_source is not None
+        )
+        if not preserve_ram_cache:
+            return self.model_unload(1e32)
+        model.detach_device_residency()
+        inactive_dynamic_models.add(model)
+        self.model_finalizer.detach()
+        self.model_finalizer = None
+        self.real_model = None
+        return True
+
     def model_use_more_vram(self, extra_memory, force_patch_weights=False):
         return self.model.partially_load(self.device, extra_memory, force_patch_weights=force_patch_weights)
 
@@ -898,6 +931,56 @@ def free_memory(memory_required, device, keep_loaded=[], for_dynamic=False, pins
                 soft_empty_cache()
     return unloaded_models
 
+def unload_device_models_except(device, keep_models=()):
+    """Unload models from one device while retaining selected clone families."""
+    keep_families = {
+        getattr(model, "clone_base_uuid", id(model))
+        for model in keep_models
+    }
+    keep_loaded = [
+        loaded_model
+        for loaded_model in current_loaded_models
+        if loaded_model.device == device
+        and getattr(loaded_model.model, "clone_base_uuid", id(loaded_model.model)) in keep_families
+    ]
+    return free_memory(1e32, device, keep_loaded=keep_loaded)
+
+
+def claim_device_models_except(device_keep_models):
+    """Atomically remove unload candidates for independent per-device cleanup.
+
+    The returned LoadedModel objects are no longer visible to model loading. This
+    lets callers release models on distinct devices concurrently without workers
+    mutating ``current_loaded_models``.
+    """
+    keep_families = {
+        device: {
+            getattr(model, "clone_base_uuid", id(model))
+            for model in keep_models
+        }
+        for device, keep_models in device_keep_models.items()
+    }
+    claimed = {device: [] for device in device_keep_models}
+    with current_loaded_models_lock:
+        retained = []
+        for loaded_model in current_loaded_models:
+            device = loaded_model.device
+            if device not in keep_families or loaded_model.is_dead():
+                retained.append(loaded_model)
+                continue
+            family = getattr(
+                loaded_model.model,
+                "clone_base_uuid",
+                id(loaded_model.model),
+            )
+            if family in keep_families[device]:
+                retained.append(loaded_model)
+                continue
+            loaded_model.currently_used = False
+            claimed[device].append(loaded_model)
+        current_loaded_models[:] = retained
+    return claimed
+
 def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimum_memory_required=None, force_full_load=False):
     cleanup_models_gc()
     global vram_state
@@ -972,8 +1055,9 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
                 models_l = free_memory(minimum_memory_required, device, for_dynamic=free_for_dynamic)
                 logging.info("{} models unloaded.".format(len(models_l)))
 
-    for loaded_model in models_to_load:
+    def load_model(loaded_model):
         model = loaded_model.model
+        inactive_dynamic_models.discard(model)
         torch_dev = model.load_device
         if is_device_cpu(torch_dev):
             vram_set_state = VRAMState.DISABLED
@@ -997,7 +1081,60 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
         vram_used = 0 if is_device_cpu(torch_dev) else loaded_model.model_loaded_memory()
         ram_used = model.loaded_ram_size() if model.is_dynamic() else loaded_model.model_memory() - vram_used
         detail("Model loaded: patcher=%s model=%s ram_mb=%.1f vram_mb=%.1f", model.__class__.__name__, model.model.__class__.__name__, ram_used / (1024 ** 2), vram_used / (1024 ** 2))
-        current_loaded_models.insert(0, loaded_model)
+
+    device_groups = {}
+    for loaded_model in models_to_load:
+        device_groups.setdefault(loaded_model.device, []).append(loaded_model)
+
+    if is_ascend_npu() and len([device for device in device_groups if device.type == "npu"]) > 1:
+        completed_ids = set()
+        errors = []
+
+        def load_device_group(device, group):
+            group_completed = []
+            try:
+                with cuda_device_context(device):
+                    for loaded_model in group:
+                        load_model(loaded_model)
+                        group_completed.append(loaded_model)
+            except Exception as error:
+                return group_completed, error
+            return group_completed, None
+
+        npu_groups = {
+            device: group
+            for device, group in device_groups.items()
+            if device.type == "npu"
+        }
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(npu_groups)) as executor:
+            futures = [
+                executor.submit(load_device_group, device, group)
+                for device, group in npu_groups.items()
+            ]
+            for future in futures:
+                group_completed, error = future.result()
+                completed_ids.update(id(loaded_model) for loaded_model in group_completed)
+                if error is not None:
+                    errors.append(error)
+
+        for device, group in device_groups.items():
+            if device.type == "npu":
+                continue
+            group_completed, error = load_device_group(device, group)
+            completed_ids.update(id(loaded_model) for loaded_model in group_completed)
+            if error is not None:
+                errors.append(error)
+                break
+
+        for loaded_model in models_to_load:
+            if id(loaded_model) in completed_ids:
+                current_loaded_models.insert(0, loaded_model)
+        if errors:
+            raise errors[0]
+    else:
+        for loaded_model in models_to_load:
+            load_model(loaded_model)
+            current_loaded_models.insert(0, loaded_model)
     return
 
 def load_model_gpu(model):
@@ -1351,6 +1488,8 @@ def current_stream(device):
         return torch.cuda.current_stream()
     elif is_device_xpu(device):
         return torch.xpu.current_stream()
+    elif is_device_type(device, 'npu') and is_ascend_npu():
+        return torch.npu.current_stream(device)
     else:
         return None
 
@@ -1801,11 +1940,13 @@ def is_device_cuda(device):
     return is_device_type(device, 'cuda')
 
 def set_torch_device(device):
-    """Set the current device for the given torch device. Supports CUDA and XPU."""
+    """Set the current device for the given torch accelerator."""
     if is_device_cuda(device):
         torch.cuda.set_device(device)
     elif is_device_xpu(device):
         torch.xpu.set_device(device)
+    elif is_device_type(device, 'npu') and is_ascend_npu():
+        torch.npu.set_device(device)
 
 def is_directml_enabled():
     global directml_enabled
@@ -2022,6 +2163,8 @@ def synchronize():
         return
     if is_intel_xpu():
         torch.xpu.synchronize()
+    elif is_ascend_npu():
+        torch.npu.synchronize()
     elif torch.cuda.is_available():
         torch.cuda.synchronize()
 

@@ -85,6 +85,7 @@ import comfy.text_encoders.gpt_oss
 import comfy.text_encoders.joyimage
 
 import comfy.model_patcher
+import comfy.checkpoint_source
 import comfy.lora
 import comfy.lora_convert
 import comfy.hooks
@@ -230,6 +231,7 @@ def load_bypass_lora_for_models(model, clip, lora, strength_model, strength_clip
 
 
 class CLIP:
+    @torch.inference_mode(False)
     def __init__(self, target=None, embedding_directory=None, no_init=False, tokenizer_data={}, parameters=0, state_dict=[], model_options={}, disable_dynamic=False):
         if no_init:
             return
@@ -248,6 +250,9 @@ class CLIP:
         params['model_options'] = model_options
 
         self.cond_stage_model = clip(**(params))
+        pre_load_model = model_options.get("pre_load_model_callback")
+        if pre_load_model is not None:
+            pre_load_model(self.cond_stage_model)
 
         for dt in self.cond_stage_model.dtypes:
             if not model_management.supports_cast(load_device, dt):
@@ -267,17 +272,23 @@ class CLIP:
         self.patcher.hook_mode = comfy.hooks.EnumHookMode.MinVram
         self.patcher.is_clip = True
         self.apply_hooks_to_conds = None
+        state_dict_transform = model_options.get("state_dict_transform")
+        assign_state_dict = model_options.get("assign_state_dict")
         if len(state_dict) > 0:
             if isinstance(state_dict, list):
                 for c in state_dict:
-                    m, u = self.load_sd(c)
+                    if state_dict_transform is not None:
+                        c = state_dict_transform(c)
+                    m, u = self.load_sd(c, assign=assign_state_dict)
                     if len(m) > 0:
                         logging.warning("clip missing: {}".format(m))
 
                     if len(u) > 0:
                         logging.debug("clip unexpected: {}".format(u))
             else:
-                m, u = self.load_sd(state_dict, full_model=True)
+                if state_dict_transform is not None:
+                    state_dict = state_dict_transform(state_dict)
+                m, u = self.load_sd(state_dict, full_model=True, assign=assign_state_dict)
                 if len(m) > 0:
                     m_filter = list(filter(lambda a: ".logit_scale" not in a and ".transformer.text_projection.weight" not in a, m))
                     if len(m_filter) > 0:
@@ -422,11 +433,11 @@ class CLIP:
         tokens = self.tokenize(text)
         return self.encode_from_tokens(tokens)
 
-    def load_sd(self, sd, full_model=False):
+    def load_sd(self, sd, full_model=False, assign=None):
+        can_assign = self.patcher.is_dynamic() if assign is None else assign
         if full_model:
-            return self.cond_stage_model.load_state_dict(sd, strict=False, assign=self.patcher.is_dynamic())
+            return self.cond_stage_model.load_state_dict(sd, strict=False, assign=can_assign)
         else:
-            can_assign = self.patcher.is_dynamic()
             self.cond_stage_model.can_assign_sd = can_assign
 
             # The CLIP models are a pretty complex web of wrappers and its
@@ -480,6 +491,7 @@ class CLIP:
         return self.patcher.is_dynamic()
 
 class VAE:
+    @torch.inference_mode(False)
     def __init__(self, sd=None, device=None, config=None, dtype=None, metadata=None):
         is_seedvr2_vae = "decoder.up_blocks.2.upsamplers.0.upscale_conv.weight" in sd
         if not is_seedvr2_vae and 'decoder.up_blocks.0.resnets.0.norm1.weight' in sd.keys(): #diffusers format
@@ -1510,15 +1522,35 @@ def load_clip_model_patcher(ckpt_paths, embedding_directory=None, clip_type=CLIP
     clip = load_clip(ckpt_paths, embedding_directory, clip_type, model_options, disable_dynamic)
     return clip.patcher
 
+def load_clip_model_patcher_from_sources(sources, ckpt_paths, embedding_directory=None, clip_type=CLIPType.STABLE_DIFFUSION, model_options={}, disable_dynamic=False):
+    clip = load_text_encoder_state_dicts(
+        [source.state_dict() for source in sources],
+        embedding_directory=embedding_directory,
+        clip_type=clip_type,
+        model_options=model_options,
+        disable_dynamic=disable_dynamic,
+    )
+    _register_clip_reload_factories(clip.patcher, sources, ckpt_paths, embedding_directory, clip_type, model_options)
+    return clip.patcher
+
+def _register_clip_reload_factories(patcher, sources, ckpt_paths, embedding_directory, clip_type, model_options):
+    patcher.cached_patcher_init = (load_clip_model_patcher, (ckpt_paths, embedding_directory, clip_type, model_options))
+    patcher.cached_patcher_init_from_source = (
+        load_clip_model_patcher_from_sources,
+        (sources, ckpt_paths, embedding_directory, clip_type, model_options),
+    )
+
 def load_clip(ckpt_paths, embedding_directory=None, clip_type=CLIPType.STABLE_DIFFUSION, model_options={}, disable_dynamic=False):
-    clip_data = []
+    sources = []
     for p in ckpt_paths:
         sd, metadata = comfy.utils.load_torch_file(p, safe_load=True, return_metadata=True)
         if model_options.get("custom_operations", None) is None:
             sd, metadata = comfy.utils.convert_old_quants(sd, model_prefix="", metadata=metadata)
-        clip_data.append(sd)
+        sources.append(comfy.checkpoint_source.CheckpointSource(sd, metadata, origin=p))
+    sources = tuple(sources)
+    clip_data = [source.state_dict() for source in sources]
     clip = load_text_encoder_state_dicts(clip_data, embedding_directory=embedding_directory, clip_type=clip_type, model_options=model_options, disable_dynamic=disable_dynamic)
-    clip.patcher.cached_patcher_init = (load_clip_model_patcher, (ckpt_paths, embedding_directory, clip_type, model_options))
+    _register_clip_reload_factories(clip.patcher, sources, ckpt_paths, embedding_directory, clip_type, model_options)
     return clip
 
 
@@ -2033,20 +2065,55 @@ def load_checkpoint(config_path=None, ckpt_path=None, output_vae=True, output_cl
 
 def load_checkpoint_guess_config(ckpt_path, output_vae=True, output_clip=True, output_clipvision=False, embedding_directory=None, output_model=True, model_options={}, te_model_options={}, disable_dynamic=False):
     sd, metadata = comfy.utils.load_torch_file(ckpt_path, return_metadata=True)
-    out = load_state_dict_guess_config(sd, output_vae, output_clip, output_clipvision, embedding_directory, output_model, model_options, te_model_options=te_model_options, metadata=metadata, disable_dynamic=disable_dynamic)
+    source = comfy.checkpoint_source.CheckpointSource(sd, metadata, origin=ckpt_path)
+    out = load_state_dict_guess_config(source.state_dict(), output_vae, output_clip, output_clipvision, embedding_directory, output_model, model_options, te_model_options=te_model_options, metadata=source.metadata(), disable_dynamic=disable_dynamic)
     if out is None:
         raise RuntimeError("ERROR: Could not detect model type of: {}\n{}".format(ckpt_path, model_detection_error_hint(ckpt_path, sd)))
+    _register_checkpoint_reload_factories(out, source, ckpt_path, embedding_directory, output_model, model_options, te_model_options)
+    return out
+
+def load_checkpoint_guess_config_from_source(source, ckpt_path, output_vae=True, output_clip=True, output_clipvision=False, embedding_directory=None, output_model=True, model_options={}, te_model_options={}, disable_dynamic=False):
+    out = load_state_dict_guess_config(
+        source.state_dict(),
+        output_vae,
+        output_clip,
+        output_clipvision,
+        embedding_directory,
+        output_model,
+        model_options,
+        te_model_options=te_model_options,
+        metadata=source.metadata(),
+        disable_dynamic=disable_dynamic,
+    )
+    if out is None:
+        raise RuntimeError(f"ERROR: Could not detect model type of: {ckpt_path}")
+    _register_checkpoint_reload_factories(out, source, ckpt_path, embedding_directory, output_model, model_options, te_model_options)
+    return out
+
+def _register_checkpoint_reload_factories(out, source, ckpt_path, embedding_directory, output_model, model_options, te_model_options):
     if out[0] is not None:
         out[0].cached_patcher_init = (load_checkpoint_guess_config, (ckpt_path, False, False, False, embedding_directory, output_model, model_options, te_model_options), 0)
+        out[0].cached_patcher_init_from_source = (
+            load_checkpoint_guess_config_from_source,
+            (source, ckpt_path, False, False, False, embedding_directory, output_model, model_options, te_model_options),
+            0,
+        )
     # Register reload factories for the CLIP and VAE produced by the same checkpoint so
     # ModelPatcher.deepclone_multigpu can spawn per-device copies (Select{CLIP,VAE}Device,
     # MultiGPU work-units, etc.) without falling back to copy.deepcopy of an
     # already-loaded module.
     if out[1] is not None and getattr(out[1], "patcher", None) is not None:
         out[1].patcher.cached_patcher_init = (load_checkpoint_clip_patcher, (ckpt_path, embedding_directory, model_options, te_model_options))
+        out[1].patcher.cached_patcher_init_from_source = (
+            load_checkpoint_clip_patcher_from_source,
+            (source, ckpt_path, embedding_directory, model_options, te_model_options),
+        )
     if out[2] is not None and getattr(out[2], "patcher", None) is not None:
         out[2].patcher.cached_patcher_init = (load_checkpoint_vae_patcher, (ckpt_path, embedding_directory, model_options, te_model_options))
-    return out
+        out[2].patcher.cached_patcher_init_from_source = (
+            load_checkpoint_vae_patcher_from_source,
+            (source, ckpt_path, embedding_directory, model_options, te_model_options),
+        )
 
 
 def load_checkpoint_clip_patcher(ckpt_path, embedding_directory=None, model_options={}, te_model_options={}, disable_dynamic=False):
@@ -2065,11 +2132,41 @@ def load_checkpoint_clip_patcher(ckpt_path, embedding_directory=None, model_opti
     )
     return clip.patcher
 
+def load_checkpoint_clip_patcher_from_source(source, ckpt_path, embedding_directory=None, model_options={}, te_model_options={}, disable_dynamic=False):
+    _, clip, _, _ = load_checkpoint_guess_config_from_source(
+        source,
+        ckpt_path,
+        output_vae=False,
+        output_clip=True,
+        output_clipvision=False,
+        embedding_directory=embedding_directory,
+        output_model=False,
+        model_options=model_options,
+        te_model_options=te_model_options,
+        disable_dynamic=disable_dynamic,
+    )
+    return clip.patcher
+
 
 def load_checkpoint_vae_patcher(ckpt_path, embedding_directory=None, model_options={}, te_model_options={}, disable_dynamic=False):
     """Reload only the VAE patcher from a checkpoint. Used as the cached_patcher_init
     factory for the VAE returned by load_checkpoint_guess_config."""
     _, _, vae, _ = load_checkpoint_guess_config(
+        ckpt_path,
+        output_vae=True,
+        output_clip=False,
+        output_clipvision=False,
+        embedding_directory=embedding_directory,
+        output_model=False,
+        model_options=model_options,
+        te_model_options=te_model_options,
+        disable_dynamic=disable_dynamic,
+    )
+    return vae.patcher
+
+def load_checkpoint_vae_patcher_from_source(source, ckpt_path, embedding_directory=None, model_options={}, te_model_options={}, disable_dynamic=False):
+    _, _, vae, _ = load_checkpoint_guess_config_from_source(
+        source,
         ckpt_path,
         output_vae=True,
         output_clip=False,
@@ -2201,6 +2298,7 @@ def load_state_dict_guess_config(sd, output_vae=True, output_clip=True, output_c
     return (model_patcher, clip, vae, clipvision)
 
 
+@torch.inference_mode(False)
 def load_diffusion_model_state_dict(sd, model_options={}, metadata=None, disable_dynamic=False):
     """
     Loads a UNet diffusion model from a state dictionary, supporting both diffusers and regular formats.
@@ -2287,12 +2385,16 @@ def load_diffusion_model_state_dict(sd, model_options={}, metadata=None, disable
     if model_options.get("fp8_optimizations", False):
         model_config.optimizations["fp8"] = True
 
-    model = model_config.get_model(new_sd, "")
+    initial_device = model_options.get("initial_device")
+    model = model_config.get_model(new_sd, "", device=initial_device)
     ModelPatcher = comfy.model_patcher.ModelPatcher if disable_dynamic else comfy.model_patcher.CoreModelPatcher
     model_patcher = ModelPatcher(model, load_device=load_device, offload_device=offload_device)
     if not model_management.is_device_cpu(offload_device):
         model.to(offload_device)
-    model.load_model_weights(new_sd, "", assign=model_patcher.is_dynamic())
+    assign_state_dict = model_options.get("assign_state_dict", model_patcher.is_dynamic())
+    model.load_model_weights(new_sd, "", assign=assign_state_dict)
+    if initial_device is not None and torch.device(initial_device).type == "meta":
+        model.device = offload_device
     left_over = sd.keys()
     if len(left_over) > 0:
         logging.info("left over keys in diffusion model: {}".format(left_over))
@@ -2300,12 +2402,32 @@ def load_diffusion_model_state_dict(sd, model_options={}, metadata=None, disable
 
 def load_diffusion_model(unet_path, model_options={}, disable_dynamic=False):
     sd, metadata = comfy.utils.load_torch_file(unet_path, return_metadata=True)
-    model = load_diffusion_model_state_dict(sd, model_options=model_options, metadata=metadata, disable_dynamic=disable_dynamic)
+    source = comfy.checkpoint_source.CheckpointSource(sd, metadata, origin=unet_path)
+    model = load_diffusion_model_state_dict(source.state_dict(), model_options=model_options, metadata=source.metadata(), disable_dynamic=disable_dynamic)
     if model is None:
         logging.error("ERROR UNSUPPORTED DIFFUSION MODEL {}".format(unet_path))
         raise RuntimeError("ERROR: Could not detect model type of: {}\n{}".format(unet_path, model_detection_error_hint(unet_path, sd)))
-    model.cached_patcher_init = (load_diffusion_model, (unet_path, model_options))
+    _register_diffusion_reload_factories(model, source, unet_path, model_options)
     return model
+
+def load_diffusion_model_from_source(source, unet_path, model_options={}, disable_dynamic=False):
+    model = load_diffusion_model_state_dict(
+        source.state_dict(),
+        model_options=model_options,
+        metadata=source.metadata(),
+        disable_dynamic=disable_dynamic,
+    )
+    if model is None:
+        raise RuntimeError(f"ERROR: Could not detect model type of: {unet_path}")
+    _register_diffusion_reload_factories(model, source, unet_path, model_options)
+    return model
+
+def _register_diffusion_reload_factories(patcher, source, unet_path, model_options):
+    patcher.cached_patcher_init = (load_diffusion_model, (unet_path, model_options))
+    patcher.cached_patcher_init_from_source = (
+        load_diffusion_model_from_source,
+        (source, unet_path, model_options),
+    )
 
 
 def load_vae_patcher(vae_path, metadata=None, device=None, disable_dynamic=False):
@@ -2323,9 +2445,24 @@ def load_vae_patcher(vae_path, metadata=None, device=None, disable_dynamic=False
         sd, metadata = comfy.utils.load_torch_file(vae_path, return_metadata=True)
     else:
         sd = comfy.utils.load_torch_file(vae_path)
-    vae = VAE(sd=sd, metadata=metadata, device=device)
+    source = comfy.checkpoint_source.CheckpointSource(sd, metadata, origin=vae_path)
+    vae = VAE(sd=source.state_dict(), metadata=source.metadata(), device=device)
     vae.throw_exception_if_invalid()
+    _register_vae_reload_factories(vae.patcher, source, vae_path, metadata, device)
     return vae.patcher
+
+def load_vae_patcher_from_source(source, vae_path, metadata=None, device=None, disable_dynamic=False):
+    vae = VAE(sd=source.state_dict(), metadata=source.metadata(), device=device)
+    vae.throw_exception_if_invalid()
+    _register_vae_reload_factories(vae.patcher, source, vae_path, metadata, device)
+    return vae.patcher
+
+def _register_vae_reload_factories(patcher, source, vae_path, metadata, device):
+    patcher.cached_patcher_init = (load_vae_patcher, (vae_path, metadata, device))
+    patcher.cached_patcher_init_from_source = (
+        load_vae_patcher_from_source,
+        (source, vae_path, metadata, device),
+    )
 
 def load_unet(unet_path, dtype=None):
     logging.warning("The load_unet function has been deprecated and will be removed please switch to: load_diffusion_model")

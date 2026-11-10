@@ -44,6 +44,12 @@ from comfy.patcher_extension import CallbacksMP, PatcherInjection, WrappersMP
 
 import comfy_aimdo.model_vbar
 
+
+def model_weight_lifecycle(function):
+    """Run model weight creation and movement outside caller inference mode."""
+    return torch.inference_mode(False)(torch.no_grad()(function))
+
+
 def is_model_patcher_output(output):
     return isinstance(output, ModelPatcher) or isinstance(getattr(output, "patcher", None), ModelPatcher)
 
@@ -381,6 +387,7 @@ class ModelPatcher:
         self.hook_mode = comfy.hooks.EnumHookMode.MaxSpeed
 
         self.cached_patcher_init: tuple[Callable, tuple] | tuple[Callable, tuple, int] | None = None
+        self.cached_patcher_init_from_source: tuple[Callable, tuple] | tuple[Callable, tuple, int] | None = None
         self.is_multigpu_base_clone = False
         self.clone_base_uuid = uuid.uuid4()
 
@@ -433,11 +440,12 @@ class ModelPatcher:
             if self.is_dynamic() and disable_dynamic:
                 class_ = ModelPatcher
             if model_override is None:
-                if self.cached_patcher_init is None:
-                    raise RuntimeError("Cannot create non-dynamic delegate: cached_patcher_init is not initialized.")
-                temp_model_patcher = self.cached_patcher_init[0](*self.cached_patcher_init[1], disable_dynamic=True)
-                if len(self.cached_patcher_init) > 2:
-                    temp_model_patcher = temp_model_patcher[self.cached_patcher_init[2]]
+                if self.cached_patcher_init is None and self.cached_patcher_init_from_source is None:
+                    raise RuntimeError("Cannot create non-dynamic delegate: no reload factory is initialized.")
+                patcher_init = self.cached_patcher_init_from_source or self.cached_patcher_init
+                temp_model_patcher = patcher_init[0](*patcher_init[1], disable_dynamic=True)
+                if len(patcher_init) > 2:
+                    temp_model_patcher = temp_model_patcher[patcher_init[2]]
                 model_override = temp_model_patcher.get_clone_model_override()
         if model_override is None:
             model_override = self.get_clone_model_override()
@@ -481,7 +489,11 @@ class ModelPatcher:
         n.is_injected = self.is_injected
         n.skip_injection = self.skip_injection
         for k, i in self.injections.items():
-            n.injections[k] = i.copy()
+            if n.model is self.model:
+                n.injections[k] = i.copy()
+            else:
+                n.is_injected = False
+                n.injections[k] = [inj.clone_for_model(n.model) for inj in i]
         # hooks
         n.hook_patches = create_hook_patches_clone(self.hook_patches)
         n.hook_patches_backup = create_hook_patches_clone(self.hook_patches_backup) if self.hook_patches_backup else self.hook_patches_backup
@@ -496,6 +508,7 @@ class ModelPatcher:
         n.hook_mode = self.hook_mode
 
         n.cached_patcher_init = self.cached_patcher_init
+        n.cached_patcher_init_from_source = self.cached_patcher_init_from_source
         n.is_multigpu_base_clone = self.is_multigpu_base_clone
         n.clone_base_uuid = self.clone_base_uuid
 
@@ -503,9 +516,10 @@ class ModelPatcher:
             callback(self, n)
         return n
 
-    def deepclone_multigpu(self, new_load_device=None, models_cache: dict[uuid.UUID,ModelPatcher]=None):
+    @model_weight_lifecycle
+    def deepclone_multigpu(self, new_load_device=None, models_cache: dict[uuid.UUID,ModelPatcher]=None, unload=True, reload_model_options=None):
         logging.info(f"Creating deepclone of {self.model.__class__.__name__} for {new_load_device if new_load_device else self.load_device}.")
-        if self.cached_patcher_init is None:
+        if self.cached_patcher_init is None and self.cached_patcher_init_from_source is None:
             raise RuntimeError(
                 f"Cannot create multigpu deepclone of {self.model.__class__.__name__}: "
                 "the loader that produced this model does not support multigpu "
@@ -513,13 +527,30 @@ class ModelPatcher:
                 "(CheckpointLoaderSimple, UNETLoader, CLIPLoader/DualCLIPLoader, VAELoader), "
                 "or have the custom loader register a cached_patcher_init factory."
             )
-        comfy.model_management.unload_model_and_clones(self)
+        if unload:
+            comfy.model_management.unload_model_and_clones(self)
         # Produce a freshly-loaded patcher from the loader factory so the multigpu
         # clone owns its own untainted model weights (rather than relying on
         # copy.deepcopy of an already-patched/already-loaded module).
-        temp_model_patcher: ModelPatcher | list[ModelPatcher] = self.cached_patcher_init[0](*self.cached_patcher_init[1])
-        if len(self.cached_patcher_init) > 2:
-            temp_model_patcher = temp_model_patcher[self.cached_patcher_init[2]]
+        patcher_init = self.cached_patcher_init_from_source or self.cached_patcher_init
+        if self.cached_patcher_init_from_source is not None:
+            logging.info(f"Reusing shared checkpoint source for {self.model.__class__.__name__}.")
+        factory, factory_args = patcher_init[:2]
+        if reload_model_options is None:
+            temp_model_patcher: ModelPatcher | list[ModelPatcher] = factory(*factory_args)
+        else:
+            signature = inspect.signature(factory)
+            if "model_options" not in signature.parameters:
+                raise RuntimeError(
+                    f"Cannot override model_options while reloading {self.model.__class__.__name__}: "
+                    f"factory {factory.__name__} does not accept model_options"
+                )
+            bound = signature.bind_partial(*factory_args)
+            base_options = bound.arguments.get("model_options", {})
+            bound.arguments["model_options"] = {**base_options, **reload_model_options}
+            temp_model_patcher = factory(*bound.args, **bound.kwargs)
+        if len(patcher_init) > 2:
+            temp_model_patcher = temp_model_patcher[patcher_init[2]]
         # Override clone()'s normal "share self.model + share backup containers" with
         # the pristine model from temp_model_patcher plus empty backup containers --
         # the fresh model has no patches applied, so any deepcopy of self's stale
@@ -527,6 +558,8 @@ class ModelPatcher:
         # no longer corresponds to anything in n.model.
         model_override = (temp_model_patcher.model, ({}, {}, {}, set()))
         n = self.clone(model_override=model_override)
+        n.cached_patcher_init = temp_model_patcher.cached_patcher_init
+        n.cached_patcher_init_from_source = temp_model_patcher.cached_patcher_init_from_source
         # clone() copies hook_backup by reference from self; reset since model is pristine.
         n.hook_backup = {}
         # set load device, if present
@@ -546,7 +579,7 @@ class ModelPatcher:
             for i in range(len(model_list)):
                 add_model = n.additional_models[key][i]
                 if add_model.clone_base_uuid not in models_cache:
-                    models_cache[add_model.clone_base_uuid] = add_model.deepclone_multigpu(new_load_device=new_load_device, models_cache=models_cache)
+                    models_cache[add_model.clone_base_uuid] = add_model.deepclone_multigpu(new_load_device=new_load_device, models_cache=models_cache, unload=unload)
                 n.additional_models[key][i] = models_cache[add_model.clone_base_uuid]
         for callback in self.get_all_callbacks(CallbacksMP.ON_DEEPCLONE_MULTIGPU):
             callback(self, n)
@@ -769,6 +802,7 @@ class ModelPatcher:
             else:
                 return comfy.utils.get_attr(self.model, name)
 
+    @model_weight_lifecycle
     def model_patches_to(self, device):
         to = self.model_options["transformer_options"]
         if "patches" in to:
@@ -896,6 +930,7 @@ class ModelPatcher:
                         sd.pop(k)
             return sd
 
+    @model_weight_lifecycle
     def patch_weight_to_device(self, key, device_to=None, inplace_update=False, return_weight=False, force_cast=False):
         weight, set_func, convert_func = get_key_weight(self.model, key)
         if key not in self.patches and not force_cast:
@@ -979,6 +1014,7 @@ class ModelPatcher:
                 loading.append(sort_criteria + (module_mem, n, m, params))
         return loading
 
+    @model_weight_lifecycle
     def load(self, device_to=None, lowvram_model_memory=0, force_patch_weights=False, full_load=False):
         with self.use_ejected():
             self.unpatch_hooks()
@@ -1110,6 +1146,7 @@ class ModelPatcher:
 
             self.apply_hooks(self.forced_hooks, force_apply=True)
 
+    @model_weight_lifecycle
     def patch_model(self, device_to=None, lowvram_model_memory=0, load_weights=True, force_patch_weights=False):
         with self.use_ejected():
             for k in self.object_patches:
@@ -1127,6 +1164,7 @@ class ModelPatcher:
         self.inject_model()
         return self.model
 
+    @model_weight_lifecycle
     def unpatch_model(self, device_to=None, unpatch_weights=True):
         self.eject_model()
         if unpatch_weights:
@@ -1168,6 +1206,7 @@ class ModelPatcher:
 
         self.object_patches_backup.clear()
 
+    @model_weight_lifecycle
     def partially_unload(self, device_to, memory_to_free=0, force_patch_weights=False):
         with self.use_ejected():
             hooks_unpatched = False
@@ -1253,6 +1292,7 @@ class ModelPatcher:
             logging.info("Unloaded partially: {:.2f} MB freed, {:.2f} MB remains loaded, {:.2f} MB buffer reserved, lowvram patches: {}".format(memory_freed / (1024 * 1024), self.model.model_loaded_weight_memory / (1024 * 1024), offload_buffer / (1024 * 1024), self.model.lowvram_patch_counter))
             return memory_freed
 
+    @model_weight_lifecycle
     def partially_load(self, device_to, extra_memory=0, force_patch_weights=False):
         with self.use_ejected(skip_and_inject_on_exit_only=True):
             unpatch_weights = self.model.current_weight_patches_uuid is not None and (self.model.current_weight_patches_uuid != self.patches_uuid or force_patch_weights)
@@ -1292,6 +1332,7 @@ class ModelPatcher:
     def partially_unload_ram(self, ram_to_unload):
         return 0
 
+    @model_weight_lifecycle
     def detach(self, unpatch_all=True):
         self.eject_model()
         self.model_patches_to(self.offload_device)
@@ -1839,6 +1880,7 @@ class ModelPatcherDynamic(ModelPatcher):
         #use all ModelPatcherDynamic this is ignored and its all done dynamically.
         return super().memory_required(input_shape=input_shape) * 1.3 + (1024 ** 3)
 
+    @model_weight_lifecycle
     def restore_loaded_backups(self):
         restored = self.model.model_loaded_weight_memory
         for key in list(self.backup.keys()):
@@ -1850,6 +1892,7 @@ class ModelPatcherDynamic(ModelPatcher):
         return restored
 
 
+    @model_weight_lifecycle
     def load(self, device_to=None, lowvram_model_memory=0, force_patch_weights=False, full_load=False, dirty=False):
 
         #Force patching doesn't make sense in Dynamic loading, as you dont know what does and
@@ -2006,6 +2049,7 @@ class ModelPatcherDynamic(ModelPatcher):
 
             self.apply_hooks(self.forced_hooks, force_apply=True)
 
+    @model_weight_lifecycle
     def partially_unload(self, device_to, memory_to_free=0, force_patch_weights=False):
         assert not force_patch_weights #See above
         assert self.load_device != torch.device("cpu")
@@ -2093,6 +2137,7 @@ class ModelPatcherDynamic(ModelPatcher):
                     return freed
         return freed
 
+    @model_weight_lifecycle
     def patch_model(self, device_to=None, lowvram_model_memory=0, load_weights=True, force_patch_weights=False):
         #This isn't used by the core at all and can only be to load a model out of
         #the control of proper model_managment. If you are a custom node author reading
@@ -2101,6 +2146,7 @@ class ModelPatcherDynamic(ModelPatcher):
         assert not load_weights
         return super().patch_model(load_weights=load_weights, force_patch_weights=force_patch_weights)
 
+    @model_weight_lifecycle
     def unpatch_model(self, device_to=None, unpatch_weights=True):
         super().unpatch_model(device_to=None, unpatch_weights=False)
 
@@ -2110,6 +2156,20 @@ class ModelPatcherDynamic(ModelPatcher):
             for m in self.model.modules():
                 move_weight_functions(m, device_to)
 
+    @model_weight_lifecycle
+    def detach_device_residency(self):
+        """Release accelerator state without discarding reusable CPU weight pins."""
+        self.eject_model()
+        self.model_patches_to(self.offload_device)
+        super().unpatch_model(device_to=None, unpatch_weights=False)
+        self.partially_unload(None, 1e32)
+        for module in self.model.modules():
+            move_weight_functions(module, self.offload_device)
+        for callback in self.get_all_callbacks(CallbacksMP.ON_DETACH):
+            callback(self, True)
+        return self.model
+
+    @model_weight_lifecycle
     def partially_load(self, device_to, extra_memory=0, force_patch_weights=False):
         assert not force_patch_weights #See above
         with self.use_ejected(skip_and_inject_on_exit_only=True):

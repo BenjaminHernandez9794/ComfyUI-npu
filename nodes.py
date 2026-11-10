@@ -24,6 +24,7 @@ import comfy.diffusers_load
 import comfy.samplers
 import comfy.sample
 import comfy.sd
+import comfy.checkpoint_source
 import comfy.utils
 import comfy.controlnet
 from comfy.comfy_types import IO, ComfyNodeABC, InputTypeDict, FileLocator
@@ -847,7 +848,8 @@ class VAELoader:
                 metadata = {"tae_latent_channels": 128}
             else:
                 metadata["tae_latent_channels"] = 128
-        vae = comfy.sd.VAE(sd=sd, metadata=metadata)
+        source = comfy.checkpoint_source.CheckpointSource(sd, metadata, origin=vae_path) if vae_path is not None else None
+        vae = comfy.sd.VAE(sd=source.state_dict() if source is not None else sd, metadata=source.metadata() if source is not None else metadata)
         vae.throw_exception_if_invalid()
         # Register a reload factory on the patcher so multigpu deepclones
         # (Select VAE Device, future MultiGPU VAE work-units) can produce
@@ -856,7 +858,7 @@ class VAELoader:
         # image TAESDs (composed from separate encoder/decoder files via
         # load_taesd) are not addressable by a single vae_path.
         if vae_path is not None:
-            vae.patcher.cached_patcher_init = (comfy.sd.load_vae_patcher, (vae_path, metadata, None))
+            comfy.sd._register_vae_reload_factories(vae.patcher, source, vae_path, metadata, None)
         return (vae,)
 
 class ControlNetLoader:
