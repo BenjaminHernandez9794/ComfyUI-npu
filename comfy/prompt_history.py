@@ -40,14 +40,24 @@ class PromptHistoryStore:
 
     def save(self, prompt_id: str, history_item: dict) -> None:
         payload = json.dumps(history_item, ensure_ascii=False, separators=(",", ":"))
-        self._connection.execute(
-            """
-            INSERT INTO prompt_history (prompt_id, payload)
-            VALUES (?, ?)
-            ON CONFLICT(prompt_id) DO UPDATE SET payload = excluded.payload
-            """,
-            (prompt_id, payload),
-        )
+        if sqlite3.sqlite_version_info >= (3, 24, 0):
+            self._connection.execute(
+                """
+                INSERT INTO prompt_history (prompt_id, payload)
+                VALUES (?, ?)
+                ON CONFLICT(prompt_id) DO UPDATE SET payload = excluded.payload
+                """,
+                (prompt_id, payload),
+            )
+        else:
+            # SQLite < 3.24 (e.g. some CANN/buildtools Python builds) has no UPSERT syntax
+            cur = self._connection.execute(
+                "UPDATE prompt_history SET payload = ? WHERE prompt_id = ?", (payload, prompt_id)
+            )
+            if cur.rowcount == 0:
+                self._connection.execute(
+                    "INSERT INTO prompt_history (prompt_id, payload) VALUES (?, ?)", (prompt_id, payload)
+                )
         self._connection.commit()
 
     def delete(self, prompt_id: str) -> None:
