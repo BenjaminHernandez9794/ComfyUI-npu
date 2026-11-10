@@ -54,6 +54,12 @@ class CompressedTimestep:
         expanded = self.data.unsqueeze(2).expand(self.batch_size, self.num_frames, self.patches_per_frame, self.feature_dim)
         return expanded.reshape(self.batch_size, -1, self.feature_dim)
 
+    def slice_sequence(self, start, stop):
+        expanded = self.expand()
+        if expanded.shape[1] == 1:
+            return self
+        return CompressedTimestep(expanded[:, start:stop].contiguous(), None)
+
     def expand_for_computation(self, scale_shift_table: torch.Tensor, batch_size: int, indices: slice = slice(None, None)):
         """Compute ada values on compressed per-frame data, then expand spatially."""
         num_ada_params = scale_shift_table.shape[0]
@@ -280,7 +286,11 @@ class BasicAVTransformerBlock(nn.Module):
             else:
                 norm_vx = comfy.quant_ops.ck.rms_adaln(vx, vscale_msa, vshift_msa)
             del vshift_msa, vscale_msa
-            attn1_out = self.attn1(norm_vx, pe=v_pe, mask=self_attention_mask, transformer_options=transformer_options)
+            attn1_out = self.attn1(
+                norm_vx, pe=v_pe, mask=self_attention_mask,
+                transformer_options=transformer_options,
+                sequence_parallel=transformer_options.get("ltx_sequence_parallel_local", False),
+            )
             del norm_vx
             # video cross-attention
             vgate_msa = self.get_ada_values(self.scale_shift_table, vx.shape[0], v_timestep, slice(2, 3))[0]
@@ -298,7 +308,10 @@ class BasicAVTransformerBlock(nn.Module):
             ashift_msa, ascale_msa = (self.get_ada_values(self.audio_scale_shift_table, ax.shape[0], a_timestep, slice(0, 2)))
             norm_ax = comfy.ldm.common_dit.rms_norm(ax) * (1 + ascale_msa) + ashift_msa
             del ashift_msa, ascale_msa
-            attn1_out = self.audio_attn1(norm_ax, pe=a_pe, transformer_options=transformer_options)
+            attn1_out = self.audio_attn1(
+                norm_ax, pe=a_pe, transformer_options=transformer_options,
+                sequence_parallel=transformer_options.get("ltx_sequence_parallel_local", False),
+            )
             del norm_ax
             # audio cross-attention
             agate_msa = self.get_ada_values(self.audio_scale_shift_table, ax.shape[0], a_timestep, slice(2, 3))[0]
@@ -328,7 +341,11 @@ class BasicAVTransformerBlock(nn.Module):
                 ax_scaled = ax_norm3 * (1 + scale_ca_audio_hidden_states_a2v) + shift_ca_audio_hidden_states_a2v
                 del scale_ca_video_hidden_states_a2v_v, shift_ca_video_hidden_states_a2v_v, scale_ca_audio_hidden_states_a2v, shift_ca_audio_hidden_states_a2v
 
-                a2v_out = self.audio_to_video_attn(vx_scaled, context=ax_scaled, pe=v_cross_pe, k_pe=a_cross_pe, transformer_options=transformer_options)
+                a2v_out = self.audio_to_video_attn(
+                    vx_scaled, context=ax_scaled, pe=v_cross_pe, k_pe=a_cross_pe,
+                    transformer_options=transformer_options,
+                    sequence_parallel=transformer_options.get("ltx_sequence_parallel_local", False),
+                )
                 del vx_scaled, ax_scaled
 
                 gate_out_a2v = self.get_ada_values(self.scale_shift_table_a2v_ca_video[4:, :], vx.shape[0], v_cross_gate_timestep)[0]
@@ -349,7 +366,11 @@ class BasicAVTransformerBlock(nn.Module):
                     vx_scaled = comfy.quant_ops.ck.rms_adaln(vx, scale_ca_video_hidden_states_v2a, shift_ca_video_hidden_states_v2a)
                 del scale_ca_video_hidden_states_v2a, shift_ca_video_hidden_states_v2a, scale_ca_audio_hidden_states_v2a, shift_ca_audio_hidden_states_v2a
 
-                v2a_out = self.video_to_audio_attn(ax_scaled, context=vx_scaled, pe=a_cross_pe, k_pe=v_cross_pe, transformer_options=transformer_options)
+                v2a_out = self.video_to_audio_attn(
+                    ax_scaled, context=vx_scaled, pe=a_cross_pe, k_pe=v_cross_pe,
+                    transformer_options=transformer_options,
+                    sequence_parallel=transformer_options.get("ltx_sequence_parallel_local", False),
+                )
                 del ax_scaled, vx_scaled
 
                 gate_out_v2a = self.get_ada_values(self.scale_shift_table_a2v_ca_audio[4:, :], ax.shape[0], a_cross_gate_timestep)[0]
@@ -391,6 +412,7 @@ class BasicAVTransformerBlock(nn.Module):
 
 class LTXAVModel(LTXVModel):
     """LTXAV model for audio-video generation."""
+    supports_sequence_parallel = True
 
     def __init__(
         self,
@@ -929,6 +951,47 @@ class LTXAVModel(LTXVModel):
         v_prompt_timestep = timestep[3]
         a_prompt_timestep = timestep[4]
 
+        sp_context = transformer_options.get("sequence_parallel_context")
+        if sp_context is not None:
+            rank = sp_context["rank"]
+            world_size = sp_context["world_size"]
+
+            def bounds(length):
+                return length * rank // world_size, length * (rank + 1) // world_size
+
+            def slice_sequence(value, start, stop):
+                if value is None:
+                    return None
+                if isinstance(value, CompressedTimestep):
+                    return value.slice_sequence(start, stop)
+                if value.shape[1] == 1:
+                    return value
+                return value[:, start:stop].contiguous()
+
+            def slice_rope(value, start, stop):
+                if value is None:
+                    return None
+                matrix, split_mode = value
+                return matrix[:, start:stop].contiguous(), split_mode
+
+            v_start, v_stop = bounds(vx.shape[1])
+            a_start, a_stop = bounds(ax.shape[1])
+            vx = vx[:, v_start:v_stop].contiguous()
+            ax = ax[:, a_start:a_stop].contiguous()
+            v_timestep = slice_sequence(v_timestep, v_start, v_stop)
+            a_timestep = slice_sequence(a_timestep, a_start, a_stop)
+            av_ca_audio_scale_shift_timestep = slice_sequence(av_ca_audio_scale_shift_timestep, a_start, a_stop)
+            av_ca_video_scale_shift_timestep = slice_sequence(av_ca_video_scale_shift_timestep, v_start, v_stop)
+            av_ca_a2v_gate_noise_timestep = slice_sequence(av_ca_a2v_gate_noise_timestep, v_start, v_stop)
+            av_ca_v2a_gate_noise_timestep = slice_sequence(av_ca_v2a_gate_noise_timestep, a_start, a_stop)
+            v_pe = slice_rope(v_pe, v_start, v_stop)
+            a_pe = slice_rope(a_pe, a_start, a_stop)
+            av_cross_video_freq_cis = slice_rope(av_cross_video_freq_cis, v_start, v_stop)
+            av_cross_audio_freq_cis = slice_rope(av_cross_audio_freq_cis, a_start, a_stop)
+            if self_attention_mask is not None:
+                self_attention_mask = self_attention_mask.slice_queries(v_start, v_stop)
+            transformer_options = {**transformer_options, "ltx_sequence_parallel_local": True}
+
         """Process transformer blocks for LTXAV."""
         patches_replace = transformer_options.get("patches_replace", {})
         blocks_replace = patches_replace.get("dit", {})
@@ -1022,6 +1085,11 @@ class LTXAVModel(LTXVModel):
             prefetch_queue, vx.device, None, malloc_scope="block"
         )
         comfy.model_prefetch.malloc_graph_end()
+
+        if sp_context is not None:
+            vx, ax = sp_context["coordinator"].exchange(
+                sp_context["rank"], (vx.contiguous(), ax.contiguous()), (1, 1)
+            )
 
         return [vx, ax]
 

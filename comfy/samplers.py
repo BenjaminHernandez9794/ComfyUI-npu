@@ -13,6 +13,7 @@ from functools import partial
 import collections
 import math
 import logging
+import threading
 import comfy.sampler_helpers
 import comfy.model_patcher
 import comfy.patcher_extension
@@ -401,59 +402,65 @@ def _calc_cond_batch_multigpu(model: BaseModel, conds: list[list[dict]], x_in: t
     device_load: dict[torch.device, int] = {d: 0 for d in devices}
 
     total_conds = sum(len(to_run) for to_run in hooked_to_run.values())
-    conds_per_device = max(1, math.ceil(total_conds / len(devices)))
+    sequence_parallel = model_options.get("sequence_parallel", False)
+    if sequence_parallel:
+        if total_conds != 1:
+            raise RuntimeError(
+                "Sequence parallelism requires exactly one conditioning work unit; "
+                f"received {total_conds}. Use BasicGuider with batch size 1."
+            )
+        for device in devices:
+            for hooks, to_run in hooked_to_run.items():
+                if to_run:
+                    device_batched_hooked_to_run.setdefault(device, []).append((hooks, list(to_run)))
+    else:
+        conds_per_device = max(1, math.ceil(total_conds / len(devices)))
 
-    def next_available_device(start: int) -> tuple[int, torch.device]:
-        """Return (index, device) for the next device with remaining capacity, starting at `start`.
+        def next_available_device(start: int) -> tuple[int, torch.device]:
+            """Return the next device with remaining work-unit capacity."""
+            for offset in range(len(devices)):
+                i = (start + offset) % len(devices)
+                if device_load[devices[i]] < conds_per_device:
+                    return i, devices[i]
+            raise RuntimeError(
+                f"MultiGPU scheduler: all {len(devices)} devices at capacity "
+                f"({conds_per_device}) but conds remain to schedule"
+            )
 
-        Scans at most len(devices) positions, so this always terminates. Raises if no device
-        has remaining capacity, which would indicate a bug in conds_per_device accounting.
-        """
-        for offset in range(len(devices)):
-            i = (start + offset) % len(devices)
-            if device_load[devices[i]] < conds_per_device:
-                return i, devices[i]
-        raise RuntimeError(
-            f"MultiGPU scheduler: all {len(devices)} devices at capacity "
-            f"({conds_per_device}) but conds remain to schedule"
-        )
+        index_device = 0
+        for hooks, to_run in hooked_to_run.items():
+            while len(to_run) > 0:
+                index_device, current_device = next_available_device(index_device)
+                remaining_capacity = conds_per_device - device_load[current_device]
 
-    # run every hooked_to_run separately
-    index_device = 0
-    for hooks, to_run in hooked_to_run.items():
-        while len(to_run) > 0:
-            index_device, current_device = next_available_device(index_device)
-            remaining_capacity = conds_per_device - device_load[current_device]
+                first = to_run[0]
+                first_shape = first[0][0].shape
+                to_batch_temp = []
+                for x in range(len(to_run)):
+                    if can_concat_cond(to_run[x][0], first[0]) and len(to_batch_temp) < remaining_capacity:
+                        to_batch_temp += [x]
 
-            first = to_run[0]
-            first_shape = first[0][0].shape
-            # collect candidate indices that can be concatenated with `first`, up to remaining capacity
-            to_batch_temp = []
-            for x in range(len(to_run)):
-                if can_concat_cond(to_run[x][0], first[0]) and len(to_batch_temp) < remaining_capacity:
-                    to_batch_temp += [x]
+                to_batch_temp.reverse()
+                to_batch = to_batch_temp[:1]
 
-            to_batch_temp.reverse()
-            to_batch = to_batch_temp[:1]
+                free_memory = comfy.model_management.get_free_memory(current_device)
+                for i in range(1, len(to_batch_temp) + 1):
+                    batch_amount = to_batch_temp[:len(to_batch_temp)//i]
+                    input_shape = [len(batch_amount) * first_shape[0]] + list(first_shape)[1:]
+                    cond_shapes = collections.defaultdict(list)
+                    for tt in batch_amount:
+                        for k, v in to_run[tt][0].conditioning.items():
+                            cond_shapes[k].append(v.size())
+                    if model.memory_required(input_shape, cond_shapes=cond_shapes) * 1.5 < free_memory:
+                        to_batch = batch_amount
+                        break
 
-            free_memory = comfy.model_management.get_free_memory(current_device)
-            for i in range(1, len(to_batch_temp) + 1):
-                batch_amount = to_batch_temp[:len(to_batch_temp)//i]
-                input_shape = [len(batch_amount) * first_shape[0]] + list(first_shape)[1:]
-                cond_shapes = collections.defaultdict(list)
-                for tt in batch_amount:
-                    for k, v in to_run[tt][0].conditioning.items():
-                        cond_shapes[k].append(v.size())
-                if model.memory_required(input_shape, cond_shapes=cond_shapes) * 1.5 < free_memory:
-                    to_batch = batch_amount
-                    break
+                conds_to_batch = [to_run.pop(x) for x in to_batch]
+                device_load[current_device] += len(conds_to_batch)
+                device_batched_hooked_to_run.setdefault(current_device, []).append((hooks, conds_to_batch))
 
-            conds_to_batch = [to_run.pop(x) for x in to_batch]
-            device_load[current_device] += len(conds_to_batch)
-            device_batched_hooked_to_run.setdefault(current_device, []).append((hooks, conds_to_batch))
-
-            if device_load[current_device] >= conds_per_device:
-                index_device += 1
+                if device_load[current_device] >= conds_per_device:
+                    index_device += 1
 
     class thread_result(NamedTuple):
         output: Any
@@ -512,6 +519,15 @@ def _calc_cond_batch_multigpu(model: BaseModel, conds: list[list[dict]], x_in: t
                     transformer_options["sigmas"] = timestep.to(device)
                     transformer_options["sample_sigmas"] = transformer_options["sample_sigmas"].to(device)
                     transformer_options["multigpu_thread_device"] = device
+                    coordinator = model_options.get("sequence_parallel_coordinator")
+                    parallel_rank = None
+                    if coordinator is not None:
+                        parallel_rank = coordinator.devices.index(device)
+                        transformer_options["sequence_parallel_context"] = {
+                            "coordinator": coordinator,
+                            "rank": parallel_rank,
+                            "world_size": coordinator.world_size,
+                        }
 
                     cast_transformer_options(transformer_options, device=device)
                     c['transformer_options'] = transformer_options
@@ -521,17 +537,24 @@ def _calc_cond_batch_multigpu(model: BaseModel, conds: list[list[dict]], x_in: t
                         c['control'] = device_control.get_control(input_x, timestep_, c, len(cond_or_uncond), transformer_options)
 
                     if 'model_function_wrapper' in model_options:
-                        output = model_options['model_function_wrapper'](model_current.apply_model, {"input": input_x, "timestep": timestep_, "c": c, "cond_or_uncond": cond_or_uncond}).to(output_device).chunk(batch_chunks)
+                        output = model_options['model_function_wrapper'](model_current.apply_model, {"input": input_x, "timestep": timestep_, "c": c, "cond_or_uncond": cond_or_uncond})
                     else:
-                        output = model_current.apply_model(input_x, timestep_, **c).to(output_device).chunk(batch_chunks)
-                    # TODO: non-NVIDIA support -- the `.to(output_device)` copies
-                    # above are async on CUDA, so the main thread's aggregation
-                    # could race with in-flight transfers. CUDA-only QA has not
-                    # surfaced this in practice, but before extending multigpu
-                    # beyond NVIDIA add a `torch.cuda.synchronize(output_device)`
-                    # here (guarded by `output_device.type == "cuda"`).
-                    results.append(thread_result(output, mult, area, batch_chunks, cond_or_uncond))
+                        output = model_current.apply_model(input_x, timestep_, **c)
+                    if parallel_rank in (None, 0):
+                        output = output.to(output_device).chunk(batch_chunks)
+                    if device.type != "cpu":
+                        comfy.model_management.synchronize()
+                    if parallel_rank in (None, 0):
+                        results.append(thread_result(output, mult, area, batch_chunks, cond_or_uncond))
+        except comfy.model_management.InterruptProcessingException:
+            coordinator = model_options.get("sequence_parallel_coordinator")
+            if coordinator is not None:
+                coordinator.abort()
+            raise
         except Exception as e:
+            coordinator = model_options.get("sequence_parallel_coordinator")
+            if coordinator is not None:
+                coordinator.abort()
             results.append(thread_result(None, None, None, None, None, error=e))
             raise
 
@@ -555,11 +578,22 @@ def _calc_cond_batch_multigpu(model: BaseModel, conds: list[list[dict]], x_in: t
             _handle_batch(device, batch_tuple, results)
 
     # Collect results from pool workers
+    worker_errors = []
     for device in pool_devices:
         worker_results, error = thread_pool.get_result(device)
         if error is not None:
-            raise error
+            worker_errors.append((device, error))
+            continue
         results.extend(worker_results)
+    if worker_errors:
+        primary_error = next(
+            (
+                error for _, error in worker_errors
+                if not isinstance(error, threading.BrokenBarrierError)
+            ),
+            worker_errors[0][1],
+        )
+        raise primary_error
 
     for output, mult, area, batch_chunks, cond_or_uncond, error in results:
         if error is not None:
@@ -1239,6 +1273,13 @@ class CFGGuider:
         return self.inner_model.process_latent_out(samples.to(torch.float32))
 
     def outer_sample(self, noise, latent_image, sampler, sigmas, denoise_mask=None, callback=None, disable_pbar=False, seed=None, latent_shapes=None):
+        offload_before_sampling = self.model_patcher.attachments.get(
+            "pipeline_offload_before_sampling", ()
+        )
+        if offload_before_sampling:
+            comfy.multigpu.offload_components(
+                *offload_before_sampling, all_devices=True, empty_cache=True
+            )
         self.inner_model, self.conds, self.loaded_models = comfy.sampler_helpers.prepare_sampling(self.model_patcher, noise.shape, self.conds, self.model_options)
         device = self.model_patcher.load_device
 
@@ -1249,6 +1290,11 @@ class CFGGuider:
             extra_devices = [p.load_device for p in multigpu_patchers]
             all_devices = [device] + extra_devices
             self.model_options["multigpu_thread_pool"] = comfy.multigpu.MultiGPUThreadPool(all_devices)
+            if self.model_options.get("sequence_parallel", False):
+                self.model_options["sequence_parallel_coordinator"] = comfy.multigpu.SequenceParallelCoordinator(
+                    all_devices,
+                    backend=self.model_options.get("sequence_parallel_backend"),
+                )
 
         with comfy.model_management.cuda_device_context(device):
             try:
@@ -1265,6 +1311,7 @@ class CFGGuider:
                 thread_pool = self.model_options.pop("multigpu_thread_pool", None)
                 if thread_pool is not None:
                     thread_pool.shutdown()
+                self.model_options.pop("sequence_parallel_coordinator", None)
                 self.model_patcher.cleanup()
                 for multigpu_patcher in multigpu_patchers:
                     multigpu_patcher.cleanup()

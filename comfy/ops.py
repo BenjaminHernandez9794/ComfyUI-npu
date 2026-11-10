@@ -1040,6 +1040,7 @@ from .quant_ops import (
     QuantizedTensor,
     QUANT_ALGOS,
     TensorCoreFP8Layout,
+    TensorWiseINT8Layout,
     get_layout_class,
 )
 
@@ -1073,6 +1074,169 @@ def _input_act_weight(x, input_act, act_weight, act_eps):
         yield act_weight, act_eps
 
 
+def _requires_full_precision_mm(module):
+    return getattr(module, "_full_precision_mm", False)
+
+
+def _is_npu_int8_linear(input, weight):
+    return (
+        comfy.model_management.is_ascend_npu()
+        and input.device.type == "npu"
+        and isinstance(weight, QuantizedTensor)
+        and weight._layout_cls == "TensorWiseINT8Layout"
+    )
+
+
+def _can_use_npu_int8_linear(input, weight, input_act=None):
+    if not (
+        _is_npu_int8_linear(input, weight)
+        and input.dtype in (torch.float16, torch.bfloat16)
+        and not getattr(weight._params, "transposed", False)
+        and input.numel() > 0
+    ):
+        return False
+    qdata, scale = TensorWiseINT8Layout.get_plain_tensors(weight)
+    input_features = input.shape[-1]
+    if input_act == "swiglu":
+        if input_features % 2 != 0:
+            return False
+        input_features //= 2
+    return (
+        qdata.dtype == torch.int8
+        and qdata.ndim == 2
+        and input_features == qdata.shape[-1]
+        and input_features % 16 == 0
+        and scale.numel() in (1, qdata.shape[0])
+    )
+
+
+def _npu_int8_linear(input, weight, bias=None, input_act=None, input_scale=None, rotated_input=None):
+    import torch_npu
+    from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation
+
+    if input_act is not None:
+        input = INPUT_ACT_EAGER[input_act](input)
+
+    qdata, weight_scale = TensorWiseINT8Layout.get_plain_tensors(weight)
+    qdata = qdata.to(device=input.device).contiguous()
+    weight_scale = weight_scale.to(device=input.device, dtype=torch.float32).reshape(-1)
+
+    orig_shape = input.shape
+    input_2d = input.reshape(-1, input.shape[-1])
+    if rotated_input is not None:
+        input_2d = rotated_input.reshape(-1, rotated_input.shape[-1])
+    elif getattr(weight._params, "convrot", False):
+        group_size = getattr(weight._params, "convrot_groupsize", 256)
+        if input_2d.shape[-1] % group_size != 0:
+            raise ValueError(
+                f"ConvRot group size {group_size} does not divide input features {input_2d.shape[-1]}"
+            )
+        h = _build_hadamard(group_size, device=input.device, dtype=input.dtype)
+        input_2d = _rotate_activation(input_2d, h, group_size)
+
+    if input_scale is None:
+        input_qdata, input_scale = quant_ops.ck.quantize_int8_rowwise(input_2d)
+    else:
+        input_scale = input_scale.to(device=input.device, dtype=torch.float32).reshape(-1, 1)
+        math_scale = input_scale.to(dtype=input.dtype)
+        math_scale = torch.where(
+            math_scale == 0,
+            torch.full_like(math_scale, torch.finfo(input.dtype).tiny),
+            math_scale,
+        )
+        input_qdata = input_2d.div(math_scale).round_().clamp_(-128, 127).to(torch.int8)
+
+    output = torch_npu.npu_quant_matmul(
+        input_qdata,
+        qdata.t(),
+        weight_scale,
+        pertoken_scale=input_scale.reshape(-1).to(dtype=torch.float32),
+        output_dtype=input.dtype,
+    )
+    if bias is not None:
+        output.add_(bias.to(device=output.device, dtype=output.dtype).reshape(1, -1))
+    return output.reshape(*orig_shape[:-1], qdata.shape[0])
+
+
+_CK_ASCEND_INT8 = None
+
+
+def _ck_ascend_int8_available():
+    """comfy-kitchen >= 0.2.41 ships a native Ascend backend (int8_linear via npu_quant_matmul).
+
+    When it is present, let the stock Comfy path dispatch to it. Set COMFY_NPU_INT8_PATCH=1 to
+    force the legacy in-tree NPU INT8 path from the Ascend-SACT patch instead.
+    """
+    global _CK_ASCEND_INT8
+    if _CK_ASCEND_INT8 is None:
+        import os
+        if os.environ.get("COMFY_NPU_INT8_PATCH", "0") == "1":
+            _CK_ASCEND_INT8 = False
+        else:
+            try:
+                info = quant_ops.ck.list_backends().get("ascend", {})
+                _CK_ASCEND_INT8 = bool(info.get("available")) and not info.get("disabled")
+            except Exception:
+                _CK_ASCEND_INT8 = False
+        logging.info("NPU INT8 linear: %s", "comfy-kitchen ascend backend" if _CK_ASCEND_INT8 else "in-tree npu_quant_matmul patch")
+    return _CK_ASCEND_INT8
+
+
+def _npu_int8_linear_or_dequant(input, weight, bias=None, input_act=None):
+    """Run an NPU INT8 linear without allowing Comfy Kitchen's CUDA fallback."""
+    if not _is_npu_int8_linear(input, weight) or _ck_ascend_int8_available():
+        return None
+    if _can_use_npu_int8_linear(input, weight, input_act=input_act):
+        return _npu_int8_linear(input, weight, bias, input_act=input_act)
+
+    # torch._int_mm is an eager CUDA fallback in Comfy Kitchen.  torch-npu moves
+    # it to the CPU, which is both extremely slow and blocks every HCCL rank.
+    # Unsupported shapes are uncommon, so prefer a device-local floating GEMM.
+    if input_act is not None:
+        input = INPUT_ACT_EAGER[input_act](input)
+    weight = weight.dequantize().to(device=input.device, dtype=input.dtype)
+    bias = None if bias is None else bias.to(device=input.device, dtype=input.dtype)
+    return torch.nn.functional.linear(input, weight, bias)
+
+
+def linear_tp_row(linear, input, tp_context, tp_rank):
+    """Apply a row-parallel linear, sharing the dynamic INT8 scale across ranks."""
+    weight = linear.weight
+    can_use_npu_int8 = (
+        not comfy.model_management.in_training
+        and getattr(linear, "pre_quant_scale", None) is None
+        and len(getattr(linear, "weight_function", ())) == 0
+        and len(getattr(linear, "bias_function", ())) == 0
+        and _can_use_npu_int8_linear(input, weight)
+    )
+    if not can_use_npu_int8:
+        return linear(input)
+
+    with CastBiasWeightContext(
+        linear,
+        input,
+        offloadable=True,
+        compute_dtype=input.dtype,
+        want_requant=True,
+    ) as (weight, bias):
+        from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation
+
+        scale_input = input
+        if getattr(weight._params, "convrot", False):
+            group_size = getattr(weight._params, "convrot_groupsize", 256)
+            h = _build_hadamard(group_size, device=input.device, dtype=input.dtype)
+            scale_input = _rotate_activation(input.reshape(-1, input.shape[-1]), h, group_size).reshape_as(input)
+        local_abs_max = scale_input.abs().amax(dim=-1, keepdim=True).float()
+        input_scale = tp_context.all_reduce_max(tp_rank, local_abs_max).div_(127.0).clamp_min_(1e-30)
+        return _npu_int8_linear(
+            input,
+            weight,
+            bias,
+            input_scale=input_scale,
+            rotated_input=scale_input,
+        )
+
+
 def _eager_input_act(x, input_act, act_weight=None, act_eps=0.0):
     if input_act is None:
         return x
@@ -1097,6 +1261,11 @@ def _try_quantized_linear_input_act(x, weight, bias, input_act, act_weight, act_
                                    residual, residual_scale):
     if comfy.model_management.in_training or not isinstance(weight, QuantizedTensor):
         return NotImplemented
+    if _is_npu_int8_linear(x, weight) and not _ck_ascend_int8_available():
+        # Ascend without the comfy-kitchen ascend backend: keep INT8 on npu_quant_matmul,
+        # since Comfy Kitchen's eager _int_mm fallback lands on the CPU under torch-npu.
+        out = _npu_int8_linear_or_dequant(_eager_input_act(x, input_act, act_weight, act_eps), weight, bias)
+        return _linear_residual(out, residual, residual_scale)
     with _input_act_weight(x, input_act, act_weight, act_eps) as (act_weight, act_eps):
         return weight.linear_input_act(
             x, bias, input_act=input_act, input_act_weight=act_weight, input_act_eps=act_eps,
@@ -1321,6 +1490,7 @@ class QuantLinearFunc(torch.autograd.Function):
 
 # Quantized-weight module helpers
 
+@torch.inference_mode(False)
 def _quantized_apply(module, fn, recurse=True):
     """Re-wrap Parameters after fn so .to()/.cuda() propagate through QuantizedTensor weights."""
     if recurse:
@@ -1330,9 +1500,7 @@ def _quantized_apply(module, fn, recurse=True):
         if param is None:
             continue
         p = fn(param)
-        if (not torch.is_inference_mode_enabled()) and p.is_inference():
-            p = p.clone()
-        module.register_parameter(key, torch.nn.Parameter(p, requires_grad=False))
+        comfy.utils.set_attr_param(module, key, p)
     for key, buf in module._buffers.items():
         if buf is not None:
             module._buffers[key] = fn(buf)
@@ -1348,7 +1516,8 @@ def _load_quantized_module(module, super_load, state_dict, prefix, local_metadat
     consumed keys from missing_keys. Reads compute_dtype from factory_kwargs
     and disabled formats from module._disabled_formats.
     """
-    device = module.factory_kwargs["device"]
+    assign = local_metadata.get("assign_to_params_buffers", False)
+    configured_device = module.factory_kwargs["device"]
     compute_dtype = module.factory_kwargs["dtype"]
     disabled_formats = module._disabled_formats
     layer_name = prefix.rstrip('.')
@@ -1359,6 +1528,11 @@ def _load_quantized_module(module, super_load, state_dict, prefix, local_metadat
         module.weight = None
         return
     manually_loaded_keys = [f"{prefix}weight"]
+    # load_state_dict(assign=True) is used to materialize a model created on
+    # meta without allocating a second copy. Preserve the checkpoint tensor's
+    # real device in that mode; moving quantization parameters to the module's
+    # configured meta device would discard their data.
+    device = weight.device if assign else configured_device
 
     def pop_scale(name, dtype=None):
         key = f"{prefix}{name}"
@@ -1476,7 +1650,7 @@ def _load_quantized_module(module, super_load, state_dict, prefix, local_metadat
                 _v = state_dict.pop(param_key, None)
                 if _v is None:
                     continue
-                module.register_parameter(param_name, torch.nn.Parameter(_v.to(device=device), requires_grad=False))
+                comfy.utils.set_attr_param(module, param_name, _v.to(device=device))
                 manually_loaded_keys.append(param_key)
 
     super_load(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
@@ -1577,6 +1751,9 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                 return _quantized_weight_state_dict(self, sd, prefix, extra_quant_params=("input_scale", "pre_quant_scale"))
 
             def _forward(self, input, weight, bias):
+                npu_output = _npu_int8_linear_or_dequant(input, weight, bias)
+                if npu_output is not None:
+                    return npu_output
                 return torch.nn.functional.linear(input, weight, bias)
 
             def forward_comfy_cast_weights(
@@ -1631,6 +1808,23 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                     len(self.weight_function) == 0 and len(self.bias_function) == 0
                 )
                 quantize_input = QUANT_ALGOS.get(getattr(self, 'quant_format', None), {}).get("quantize_input", True)
+
+                if (
+                    _use_quantized
+                    and quantize_input
+                    and getattr(self, 'layout_type', None) == "TensorWiseINT8Layout"
+                    and not isinstance(input, QuantizedTensor)
+                ):
+                    with CastBiasWeightContext(
+                        self,
+                        input,
+                        offloadable=True,
+                        compute_dtype=compute_dtype,
+                        want_requant=True,
+                    ) as (weight, bias):
+                        npu_output = _npu_int8_linear_or_dequant(input, weight, bias)
+                        if npu_output is not None:
+                            return npu_output
 
                 # Training path: quantized forward with compute_dtype backward via autograd function
                 if (input.requires_grad and _use_quantized and quantize_input):
@@ -1693,7 +1887,7 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                     return weight
 
                 assert inplace_update is False  # TODO: eventually remove the inplace_update stuff
-                self.weight = torch.nn.Parameter(weight, requires_grad=False)
+                comfy.utils.set_attr_param(self, "weight", weight)
 
             def _apply(self, fn, recurse=True):  # This is to get torch.compile + moving weights to another device working
                 return _quantized_apply(self, fn, recurse)
