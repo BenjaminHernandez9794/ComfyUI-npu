@@ -774,6 +774,11 @@ class disable_weight_init:
             return None
 
         def cast_weight(self, input):
+            # torch_npu 给 nn.Module 打了同名方法 cast_weight(device)，Module.to()/npu() 会以 device 调用它；
+            # 这里按参数类型分流，避免 'torch.device' object has no attribute 'dtype'
+            if input is None or isinstance(input, (torch.device, str, int)):
+                npu_cast_weight = getattr(torch.nn.Module, "cast_weight", None)
+                return npu_cast_weight(self, input) if npu_cast_weight is not None else None
             return CastBiasWeightContext(self if self.weight is not None else None, input, offloadable=True)
 
         def forward_comfy_cast_weights(self, input):
