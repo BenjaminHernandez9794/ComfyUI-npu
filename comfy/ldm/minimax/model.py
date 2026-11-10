@@ -200,10 +200,20 @@ class Attention(nn.Module):
         else:
             q = self.q_norm(q.view(s, self.heads, self.head_dim))
             k = self.k_norm(k.view(s, self.heads, self.head_dim))
-
-        q = AttentionTensorContainer(q.transpose(0, 1).unsqueeze(0))
-        k = AttentionTensorContainer(k.transpose(0, 1).unsqueeze(0))
-        v = AttentionTensorContainer(v.transpose(0, 1).unsqueeze(0))
+        q = q.transpose(0, 1).unsqueeze(0)
+        k = k.transpose(0, 1).unsqueeze(0)
+        v = v.transpose(0, 1).unsqueeze(0)
+        sp_context = transformer_options.get("sequence_parallel_context")
+        if sp_context is not None:
+            q = q.contiguous()
+            k, v = sp_context["coordinator"].exchange(
+                sp_context["rank"], (k.contiguous(), v.contiguous()), (2, 2)
+            )
+        else:
+            v = v.clone()
+        q = AttentionTensorContainer(q)
+        k = AttentionTensorContainer(k)
+        v = AttentionTensorContainer(v)
         out = optimized_attention(q, k, v, self.heads, preferred_attention=self.comfy_attention, mask=None, skip_reshape=True, transformer_options=transformer_options)
         return self.out_proj(out.squeeze(0))
 
@@ -505,6 +515,7 @@ class PackedLayout:
 
 
 class MiniMaxH3Model(nn.Module):
+    supports_sequence_parallel = True
     def __init__(self, hidden_size=5376, num_layers=50, token_refiner_num_layers=2,
                  num_attention_heads=56, attention_head_dim=128, ffn_hidden_size=14336,
                  latents_dim=24, audio_latents_dim=32, patch_size=(1, 2, 2), text_dim=5120,
@@ -618,8 +629,12 @@ class MiniMaxH3Model(nn.Module):
             audio_embed = self.audio_patch_proj(all_audio_rows).to(dtype)
         text_states = context[0]
         if text_states.shape[-1] != self.hidden_size:
+            refiner_transformer_options = transformer_options
+            if "sequence_parallel_context" in transformer_options:
+                refiner_transformer_options = transformer_options.copy()
+                refiner_transformer_options.pop("sequence_parallel_context")
             text_states = self.token_refiner(self.condition_proj(text_states),
-                                             transformer_options=transformer_options)
+                                             transformer_options=refiner_transformer_options)
 
         # segments are contiguous: assemble by slices, embed rows follow segment order
         h = torch.empty(layout.seq_len, self.hidden_size, dtype=dtype, device=device)
@@ -651,6 +666,21 @@ class MiniMaxH3Model(nn.Module):
         # rotation table computed once per forward, consumed by the kitchen split-half rope
         rope_freqs = rope_rotation_table(self.rope_freqs(layout.position_ids, device), h.dtype)
 
+        sp_context = transformer_options.get("sequence_parallel_context")
+        if sp_context is not None:
+            # sequence parallel: each rank runs the blocks on its slice of the packed sequence
+            rank = sp_context["rank"]
+            world_size = sp_context["world_size"]
+            start = layout.seq_len * rank // world_size
+            stop = layout.seq_len * (rank + 1) // world_size
+            h = h[start:stop].clone()
+            rope_freqs = rope_freqs[:, start:stop].clone()
+            mod_segments = [
+                (max(a, start) - start, min(b, stop) - start, row)
+                for a, b, row in mod_segments
+                if max(a, start) < min(b, stop)
+            ]
+
         patches_replace = transformer_options.get("patches_replace", {})
         blocks_replace = patches_replace.get("dit", {})
         prefetch_queue = comfy.model_prefetch.make_prefetch_queue(list(self.blocks), device, transformer_options)
@@ -668,6 +698,8 @@ class MiniMaxH3Model(nn.Module):
             else:
                 h = block(h, t_emb, mod_segments, rope_freqs, transformer_options=transformer_options)
         comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, None, malloc_scope="block")
+        if sp_context is not None:
+            h, = sp_context["coordinator"].exchange(rank, (h,), (0,))
         return h
 
     def forward(self, x, timestep, context, transformer_options={}, minimax_payload=None, denoise_mask=None, audio_denoise_mask=None, **kwargs):
