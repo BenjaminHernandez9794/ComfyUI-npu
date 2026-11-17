@@ -16,6 +16,200 @@ import comfy.model_management
 import comfy.multigpu
 
 
+def _place_minimax_clip_tp(clip, devices):
+    import comfy.text_encoders.minimax
+
+    world_size = len(devices)
+    reload_options = [
+        comfy.text_encoders.minimax.minimax_h3_tp_reload_model_options(world_size, rank)
+        for rank in range(world_size)
+    ]
+    patchers = comfy.multigpu.deepclone_patcher_to_devices(
+        clip.patcher,
+        devices,
+        reload_model_options=reload_options,
+    )
+    for patcher, device in zip(patchers, devices):
+        patcher.load_device = device
+        patcher.remove_additional_models("multigpu")
+    comfy.text_encoders.minimax.connect_minimax_h3_text_tensor_parallel(patchers, devices)
+    placed = clip.clone()
+    placed.patcher = patchers[0]
+    placed.cond_stage_model = patchers[0].model
+    return placed
+
+
+class MultiNPUParallelConfig(io.ComfyNode):
+    ROLE_INDICES = {
+        1: {"video_vae": 0, "text_encoder": 0, "dit": 0, "audio_vae": 0},
+        2: {"video_vae": 0, "text_encoder": 0, "dit": 0, "audio_vae": 1},
+        4: {"video_vae": 0, "text_encoder": 0, "dit": 2, "audio_vae": 3},
+    }
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MultiNPUParallelConfig",
+            display_name="Multi-NPU Parallel Config",
+            description="Configure stage placement, DiT sequence parallelism, optional text tensor parallelism, and tiled video VAE parallelism.",
+            category="advanced/multigpu",
+            inputs=[
+                io.Model.Input("model"),
+                io.Clip.Input("clip"),
+                io.Vae.Input("video_vae"),
+                io.Vae.Input("audio_vae"),
+                io.Combo.Input("npu_count", options=["1", "2", "4"], default="4"),
+            ],
+            outputs=[
+                io.Model.Output(),
+                io.Clip.Output(),
+                io.Vae.Output(display_name="video_vae"),
+                io.Vae.Output(display_name="audio_vae"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, model, clip, video_vae, audio_vae, npu_count) -> io.NodeOutput:
+        count = int(npu_count)
+        if count not in cls.ROLE_INDICES:
+            raise ValueError(f"Parallel NPU count must be 1, 2, or 4; got {count}")
+        available = tuple(comfy.model_management.get_all_torch_devices(exclude_current=False))
+        if count > len(available):
+            raise RuntimeError(f"Requested {count} devices, but only {len(available)} are visible")
+        devices = available[:count]
+        if any(device.type != "npu" for device in devices):
+            raise RuntimeError(f"Multi-NPU parallelism requires NPU devices, got {devices}")
+
+        roles = cls.ROLE_INDICES[count].copy()
+        diffusion_model = getattr(model.model, "diffusion_model", None)
+        if count > 1 and not getattr(diffusion_model, "supports_sequence_parallel", False):
+            raise TypeError(
+                f"{diffusion_model.__class__.__name__ if diffusion_model is not None else model.model.__class__.__name__} "
+                "does not declare sequence-parallel support"
+            )
+        if model.load_device in devices:
+            roles["dit"] = devices.index(model.load_device)
+        configured_model = comfy.multigpu.clone_patcher_to_device(model, devices[roles["dit"]])
+        configured_model.load_device = devices[roles["dit"]]
+        if count > 1:
+            configured_model = comfy.multigpu.create_multigpu_deepclones(
+                configured_model,
+                count,
+                reuse_loaded=True,
+                reload_model_options={
+                    "initial_device": torch.device("meta"),
+                    "assign_state_dict": True,
+                },
+            )
+            replicas = 1 + len(configured_model.get_additional_models_with_key("multigpu"))
+            if replicas != count:
+                raise RuntimeError(f"Prepared {replicas}/{count} DiT replicas")
+        else:
+            configured_model.remove_additional_models("multigpu")
+
+        if count > 1 and hasattr(clip.patcher.model, "qwen3vl_32b"):
+            configured_clip = _place_minimax_clip_tp(clip, devices)
+            text_parallel = "tensor"
+        else:
+            configured_clip = comfy.multigpu.place_clip(clip, devices[roles["text_encoder"]])
+            text_parallel = "single"
+        configured_video_vae = comfy.multigpu.place_vae(video_vae, devices[roles["video_vae"]])
+        configured_audio_vae = comfy.multigpu.place_vae(audio_vae, devices[roles["audio_vae"]])
+        config = {
+            "device_count": count,
+            "devices": devices,
+            "roles": {name: devices[index] for name, index in roles.items()},
+            "text_parallel": text_parallel,
+        }
+        configured_model.model_options["sequence_parallel"] = count > 1
+        configured_model.model_options["multi_npu_parallel_config"] = config
+        configured_model.attachments["pipeline_offload_before_sampling"] = (
+            configured_clip,
+            configured_video_vae,
+            configured_audio_vae,
+        )
+        configured_video_vae.multi_device_config = config
+        configured_video_vae.previous_stage_components = (
+            configured_model,
+            configured_clip,
+            configured_audio_vae,
+        )
+        return io.NodeOutput(
+            configured_model, configured_clip, configured_video_vae, configured_audio_vae
+        )
+
+
+class VAEDecodeTiledMultiDevice(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="VAEDecodeTiledMultiDevice",
+            display_name="VAE Decode Tiled (Multi-Device)",
+            description="Offload the preceding model stage, decode independent VAE tiles across configured devices, and feather-merge the result.",
+            category="model/latent",
+            inputs=[
+                io.Latent.Input("samples"),
+                io.Vae.Input("vae"),
+                io.Int.Input("tile_size", default=512, min=64, max=4096, step=32, advanced=True),
+                io.Int.Input("overlap", default=64, min=0, max=4096, step=32, advanced=True),
+                io.Int.Input("temporal_size", default=64, min=8, max=4096, step=4, advanced=True),
+                io.Int.Input("temporal_overlap", default=8, min=4, max=4096, step=4, advanced=True),
+                io.Model.Input("model", optional=True),
+            ],
+            outputs=[io.Image.Output()],
+        )
+
+    @classmethod
+    def execute(cls, samples, vae, tile_size, overlap=64, temporal_size=64, temporal_overlap=8, model=None):
+        latent = samples["samples"]
+        if latent.is_nested:
+            latent = latent.unbind()[0]
+        if tile_size < overlap * 4:
+            overlap = tile_size // 4
+        if temporal_size < temporal_overlap * 2:
+            temporal_overlap = temporal_size // 2
+
+        compression = vae.spacial_compression_decode()
+        if latent.ndim == 5:
+            temporal_compression = vae.temporal_compression_decode()
+            if temporal_compression is not None:
+                temporal_size = max(2, temporal_size // temporal_compression)
+                temporal_overlap = max(1, min(temporal_size // 2, temporal_overlap // temporal_compression))
+            else:
+                temporal_size = latent.shape[2]
+                temporal_overlap = 0
+            tile = (temporal_size, tile_size // compression, tile_size // compression)
+            tile_overlap = (temporal_overlap, overlap // compression, overlap // compression)
+        elif latent.ndim == 4:
+            tile = (tile_size // compression, tile_size // compression)
+            tile_overlap = (overlap // compression, overlap // compression)
+        else:
+            raise ValueError(f"Unsupported VAE latent rank for tiled decode: {latent.ndim}")
+
+        if model is None:
+            previous_components = getattr(vae, "previous_stage_components", ())
+            model = next(
+                (component for component in previous_components if hasattr(component, "model_options")),
+                None,
+            )
+        else:
+            previous_components = (model,)
+        config = getattr(vae, "multi_device_config", None)
+        if config is None and model is not None:
+            config = model.model_options.get("multi_npu_parallel_config")
+        devices = tuple(config["devices"]) if config is not None else (vae.device,)
+        if previous_components:
+            comfy.multigpu.offload_components(
+                *previous_components, all_devices=True, empty_cache=True
+            )
+        images = comfy.multigpu.decode_tiled_multidevice(
+            vae, latent, devices, tile=tile, overlap=tile_overlap
+        )
+        if images.ndim == 5:
+            images = images.reshape(-1, images.shape[-3], images.shape[-2], images.shape[-1])
+        return io.NodeOutput(images)
+
+
 class MultiGPUCFGSplitNode(io.ComfyNode):
     """
     Prepares model to have sampling accelerated via splitting work units.
@@ -390,6 +584,8 @@ class MultiGPUExtension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
         return [
+            MultiNPUParallelConfig,
+            VAEDecodeTiledMultiDevice,
             MultiGPUCFGSplitNode,
             SelectModelDeviceNode,
             SelectCLIPDeviceNode,

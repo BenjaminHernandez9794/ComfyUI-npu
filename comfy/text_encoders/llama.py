@@ -704,6 +704,8 @@ class Attention(nn.Module):
         optimized_attention=None,
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         sliding_window: Optional[int] = None,
+        tp_context=None,
+        tp_rank: Optional[int] = None,
     ):
         batch_size, seq_length, _ = hidden_states.shape
 
@@ -784,7 +786,12 @@ class Attention(nn.Module):
 
         gqa_kwargs = {"enable_gqa": True} if self.num_heads != self.num_kv_heads else {}
         output = optimized_attention(xq, xk, xv, self.num_heads, mask=attention_mask, skip_reshape=True, **gqa_kwargs)
-        return self.o_proj(output), present_key_value
+        if tp_context is not None:
+            output = comfy.ops.linear_tp_row(self.o_proj, output, tp_context, tp_rank)
+            output = tp_context.all_reduce_sum(tp_rank, output)
+        else:
+            output = self.o_proj(output)
+        return output, present_key_value
 
 class MLP(nn.Module):
     def __init__(self, config: Llama2Config, device=None, dtype=None, ops: Any = None, intermediate_size=None):
@@ -805,8 +812,15 @@ class MLP(nn.Module):
             self.activation = lambda a: torch.nn.functional.gelu(a, approximate="tanh")
             self.merged_input_act = None
 
-    def forward(self, x, norm=None):
+    def forward(self, x, norm=None, tp_context=None, tp_rank=None):
         # norm: the block's pre-norm, folded into the merged projection's input quantizer where supported
+        if tp_context is not None:
+            # Ascend multi-NPU tensor parallel: gate/up are column shards, down is a row shard
+            if norm is not None:
+                x = norm(x)
+            x = self.activation(self.gate_proj(x)) * self.up_proj(x)
+            x = comfy.ops.linear_tp_row(self.down_proj, x, tp_context, tp_rank)
+            return tp_context.all_reduce_sum(tp_rank, x)
         gate_up = self.gate_up_proj if self.merged_mlp else self.combined_gate_up
         if norm is not None:
             combined = comfy.ops.linear_input_act(gate_up, x, "rms_norm", norm.scale(), norm.eps)
@@ -836,6 +850,8 @@ class TransformerBlock(nn.Module):
         freqs_cis: Optional[torch.Tensor] = None,
         optimized_attention=None,
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        tp_context=None,
+        tp_rank: Optional[int] = None,
     ):
         output = x
         # Self Attention
@@ -847,13 +863,15 @@ class TransformerBlock(nn.Module):
             freqs_cis=freqs_cis,
             optimized_attention=optimized_attention,
             past_key_value=past_key_value,
+            tp_context=tp_context,
+            tp_rank=tp_rank,
         )
         x = residual + x
 
         # MLP
         residual = x
         x = self.post_attention_layernorm(x)
-        x = self.mlp(x)
+        x = self.mlp(x, tp_context=tp_context, tp_rank=tp_rank)
         x = torch.add(residual, x, out=output)
 
         return x, present_key_value
@@ -1004,7 +1022,8 @@ class Llama2_(nn.Module):
                                     device=device)
 
     def forward(self, x, attention_mask=None, embeds=None, num_tokens=None, intermediate_output=None, final_layer_norm_intermediate=True,
-                dtype=None, position_ids=None, embeds_info=[], past_key_values=None, input_ids=None,deepstack_embeds=None, visual_pos_masks=None, decode_buffers=None, freqs_cis=None):
+                dtype=None, position_ids=None, embeds_info=[], past_key_values=None, input_ids=None,deepstack_embeds=None, visual_pos_masks=None, decode_buffers=None, freqs_cis=None,
+                tp_context=None, tp_rank=None):
         if embeds is not None:
             x = embeds
         else:
@@ -1065,6 +1084,7 @@ class Llama2_(nn.Module):
 
         prefetch_queue = comfy.model_prefetch.make_prefetch_queue(list(self.layers), x.device, {"prefetch_dynamic_vbars": self.prefetch_dynamic_vbars and past_key_values is not None})
         next_key_values = list(past_key_values) if past_key_values is not None else []
+        tp_kwargs = {} if tp_context is None else {"tp_context": tp_context, "tp_rank": tp_rank}
         for i, layer in enumerate(self.layers):
             if all_intermediate is not None:
                 if only_layers is None or (i in only_layers):
@@ -1088,6 +1108,7 @@ class Llama2_(nn.Module):
                     freqs_cis=freqs_cis,
                     optimized_attention=optimized_attention,
                     past_key_value=past_kv,
+                    **tp_kwargs,
                 )
                 if enable_graph:
                     x.copy_(output)

@@ -897,67 +897,62 @@ class MiniMaxH3VideoVAE(nn.Module):
                 output_buffer[i:i + 1, :, f0:f0 + part.shape[2]].copy_(self._finalize_pixels(part))
         return output_buffer
 
-    def decode_temporal(self, z, output_buffer=None):
-        chunk_dec = self.tokens_chunk_size * self.vae_ratio_t
-        split_count = int(self.token_drop > 0) + 1
-
-        if output_buffer is None:
-            # finalized chunks stream out of VRAM so the full video never sits on the GPU
-            output_buffer = torch.empty(self.decode_output_shape(z.shape), dtype=torch.float32,
-                                        device=comfy.model_management.intermediate_device())
-
+    def prepare_decode_temporal(self, z):
+        """Pad temporal latents and return the independent decoder chunk plan."""
         pad_tokens, num_chunks = self._decode_temporal_chunks(z.shape[2])
         if pad_tokens > 0:
             pad_z = z[:, :, -1:, :, :].repeat(1, 1, pad_tokens, 1, 1)
             z = torch.cat([z, pad_z], dim=2)
+        chunks = []
+        for i in range(num_chunks):
+            start = i * self.tokens_chunk_size
+            stop = start + self.tokens_chunk_size + self.token_overlap
+            chunks.append(z[:, :, start:stop, :, :])
+        return chunks
 
-        dec = output_buffer
+    def merge_decode_temporal(self, decoded_chunks, output_buffer):
+        """Merge raw temporal decoder chunks into a finalized output buffer."""
+        chunk_dec = self.tokens_chunk_size * self.vae_ratio_t
+        split_count = int(self.token_drop > 0) + 1
         dec_overlap = None
         write_pos = 0
 
         def write_part(part):
             nonlocal write_pos
-            part_frames = part.shape[2]
-            if part_frames <= 0:
+            if part.shape[2] <= 0:
                 return
             part = self._finalize_pixels(part)
-            copy_frames = min(part_frames, max(0, dec.shape[2] - write_pos))
+            copy_frames = min(part.shape[2], max(0, output_buffer.shape[2] - write_pos))
             if copy_frames > 0:
-                dec[:, :, write_pos:write_pos + copy_frames, :, :].copy_(
-                    part[:, :, :copy_frames, :, :]
-                )
+                output_buffer[:, :, write_pos:write_pos + copy_frames].copy_(part[:, :, :copy_frames])
                 write_pos += copy_frames
 
-        for i in range(num_chunks):
-            t_start_idx = i * self.tokens_chunk_size
-            t_end_idx = t_start_idx + self.tokens_chunk_size + self.token_overlap
-            clip_z = z[:, :, t_start_idx:t_end_idx, :, :]
-
-            clip_dec = self._adaptive_decode(clip_z)
-
+        for clip_dec in decoded_chunks:
             for j in range(split_count):
-                f_start_idx = j * chunk_dec
-                f_end_idx = min(f_start_idx + chunk_dec, clip_dec.shape[2])
-                clip_dec_chunk = clip_dec[:, :, f_start_idx:f_end_idx, :, :]
-                clip_dec_chunk = clip_dec_chunk[:, :, self.frame_pre_padding:, :, :]
-
+                start = j * chunk_dec
+                stop = min(start + chunk_dec, clip_dec.shape[2])
+                part = clip_dec[:, :, start:stop, :, :]
+                part = part[:, :, self.frame_pre_padding:, :, :]
                 if j == 0:
                     if dec_overlap is not None:
-                        clip_dec_chunk = self.blend(
-                            dec_overlap, clip_dec_chunk, self.frame_overlap, dim=-3
-                        )
+                        part = self.blend(dec_overlap, part, self.frame_overlap, dim=-3)
                         dec_overlap = None
-                    write_part(clip_dec_chunk)
+                    write_part(part)
                 else:
-                    dec_overlap = clip_dec_chunk.contiguous()
+                    dec_overlap = part.contiguous()
 
-            if i == num_chunks - 1 and dec_overlap is not None:
-                write_part(dec_overlap)
-                dec_overlap = None
+        if dec_overlap is not None:
+            write_part(dec_overlap)
+        return output_buffer
 
-            del clip_dec, clip_z, clip_dec_chunk
+    def decode_temporal(self, z, output_buffer=None):
+        if output_buffer is None:
+            # finalized chunks stream out of VRAM so the full video never sits on the GPU
+            output_buffer = torch.empty(self.decode_output_shape(z.shape), dtype=torch.float32,
+                                        device=comfy.model_management.intermediate_device())
 
-        return dec
+        chunks = self.prepare_decode_temporal(z)
+        return self.merge_decode_temporal((self._adaptive_decode(chunk) for chunk in chunks), output_buffer)
 
 
     def encode(self, x, device=None):

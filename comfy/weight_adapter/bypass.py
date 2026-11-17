@@ -15,6 +15,7 @@ This is useful for:
     - Supporting multiple adapters with different strengths dynamically
 """
 
+import copy
 import logging
 from typing import Optional, Union
 
@@ -395,7 +396,19 @@ class BypassInjectionManager:
             for hook in self.hooks:
                 hook.eject()
 
-        return [PatcherInjection(inject=inject_all, eject=eject_all)]
+        def clone_for_model(clone_model):
+            clone_manager = BypassInjectionManager()
+            clone_manager.adapters = {
+                key: (copy.copy(adapter), strength)
+                for key, (adapter, strength) in self.adapters.items()
+            }
+            return clone_manager.create_injections(clone_model)[0]
+
+        return [PatcherInjection(
+            inject=inject_all,
+            eject=eject_all,
+            clone_for_model=clone_for_model,
+        )]
 
     def get_hook_count(self) -> int:
         """Return number of hooks that will be/are injected."""
